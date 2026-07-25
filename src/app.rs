@@ -17,7 +17,7 @@ pub const REVEAL_HINT: &str = "select";
 /// Everything built once at startup and shared by every window.
 struct AppState {
     config: Rc<RefCell<Config>>,
-    registry: Rc<Registry>,
+    registry: Rc<RefCell<Registry>>,
     theme: ThemeProvider,
     /// Deferred until a window exists to show it in.
     startup_notice: RefCell<Option<String>>,
@@ -102,7 +102,7 @@ fn start_up() -> AppState {
     }
 
     let config = Rc::new(RefCell::new(loaded.config));
-    let registry = Rc::new(registry);
+    let registry = Rc::new(RefCell::new(registry));
 
     let theme = match gtk::gdk::Display::default() {
         Some(display) => {
@@ -111,6 +111,7 @@ fn start_up() -> AppState {
             provider.connect_diagnostics();
 
             let borrowed = config.borrow();
+            let registry = registry.borrow();
             let palette = registry.get_or_default(&borrowed.appearance.flavor);
             let options = crate::theme::StyleOptions {
                 accent: borrowed.appearance.accent,

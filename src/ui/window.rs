@@ -12,7 +12,7 @@ use crate::model::History;
 use crate::model::filter::FilterSpec;
 use crate::model::sort::SortSpec;
 use crate::model::undo;
-use crate::theme::{Registry, StyleOptions, ThemeProvider};
+use crate::theme::{Registry, StyleOptions, ThemeProvider, system};
 use crate::ui::breadcrumb::Breadcrumb;
 use crate::ui::clipboard::FileClipboard;
 use crate::ui::context_menu;
@@ -21,6 +21,7 @@ use crate::ui::dialogs;
 use crate::ui::file_pane::FilePane;
 use crate::ui::keys;
 use crate::ui::path_entry::PathEntry;
+use crate::ui::preferences;
 use crate::ui::sidebar::Sidebar;
 use crate::ui::status_bar::StatusBar;
 
@@ -37,7 +38,7 @@ pub struct Window {
     toasts: adw::ToastOverlay,
     split: adw::OverlaySplitView,
     pub(crate) config: Rc<RefCell<Config>>,
-    registry: Rc<Registry>,
+    pub(crate) registry: Rc<RefCell<Registry>>,
     theme: ThemeProvider,
     status_debouncer: RefCell<Option<Debouncer>>,
     history: RefCell<History<String>>,
@@ -57,13 +58,16 @@ pub struct Window {
     pub(crate) busy: std::cell::Cell<bool>,
     pub(crate) undo_action: gio::SimpleAction,
     last_toast: RefCell<Option<adw::Toast>>,
+    /// The Flavor submenu, rebuilt whenever the theme list changes.
+    flavor_menu: gio::Menu,
+    pub(crate) flavor_action: gio::SimpleAction,
 }
 
 impl Window {
     pub fn new(
         app: &adw::Application,
         config: Rc<RefCell<Config>>,
-        registry: Rc<Registry>,
+        registry: Rc<RefCell<Registry>>,
         theme: ThemeProvider,
     ) -> Rc<Self> {
         let (filter_spec, sort_spec, view_mode) = {
@@ -162,6 +166,13 @@ impl Window {
         let undo_action = gio::SimpleAction::new("undo", None);
         undo_action.set_enabled(false);
 
+        let active_flavor = config.borrow().appearance.flavor.clone();
+        let flavor_action = gio::SimpleAction::new_stateful(
+            "flavor",
+            Some(glib::VariantTy::STRING),
+            &active_flavor.to_variant(),
+        );
+
         let this = Rc::new(Self {
             window,
             file_pane,
@@ -189,6 +200,8 @@ impl Window {
             busy: std::cell::Cell::new(false),
             undo_action,
             last_toast: RefCell::new(None),
+            flavor_menu: gio::Menu::new(),
+            flavor_action,
         });
 
         this.build_header(&header);
@@ -201,6 +214,17 @@ impl Window {
         this.wire_close_request();
         context_menu::install(&this);
         this.apply_theme();
+
+        // Best effort: if the portal never answers, this simply never fires and
+        // the configured flavor stays in place.
+        let watcher = Rc::downgrade(&this);
+        system::watch(move |_| {
+            if let Some(window) = watcher.upgrade()
+                && window.config.borrow().appearance.follow_system
+            {
+                window.apply_theme();
+            }
+        });
 
         this
     }
@@ -245,11 +269,22 @@ impl Window {
         view_section.append(Some("Grid View"), Some("win.toggle-view"));
         menu.append_section(None, &view_section);
 
+        // The flavor switcher lives here as well as in the dialog: switching is
+        // a thing you do often and idly, and it should not cost a dialog.
+        let theme_section = gio::Menu::new();
+        theme_section.append_submenu(Some("Flavor"), &self.flavor_menu);
+        theme_section.append(Some("Appearance…"), Some("win.appearance"));
+        menu.append_section(None, &theme_section);
+        self.rebuild_flavor_menu();
+
         let app_section = gio::Menu::new();
         app_section.append(Some("About Hive"), Some("win.about"));
         menu.append_section(None, &app_section);
 
         let menu_button = gtk::MenuButton::new();
+        // F10 is the conventional way into an application's primary menu, and
+        // it is the only route to the flavor switcher without a mouse.
+        menu_button.set_primary(true);
         menu_button.set_icon_name("open-menu-symbolic");
         menu_button.set_tooltip_text(Some("Main menu"));
         menu_button.set_menu_model(Some(&menu));
@@ -672,6 +707,22 @@ impl Window {
         about.connect_activate(move |_, _| this.show_about());
         self.window.add_action(&about);
 
+        let appearance = gio::SimpleAction::new("appearance", None);
+        let this = Rc::clone(self);
+        appearance.connect_activate(move |_, _| preferences::present(&this));
+        self.window.add_action(&appearance);
+
+        let this = Rc::clone(self);
+        self.flavor_action
+            .connect_activate(move |action, parameter| {
+                let Some(id) = parameter.and_then(glib::Variant::str) else {
+                    return;
+                };
+                action.set_state(&id.to_variant());
+                this.set_flavor(id);
+            });
+        self.window.add_action(&self.flavor_action);
+
         let simple = [
             (
                 "go-back",
@@ -712,6 +763,7 @@ impl Window {
         app.set_accels_for_action("win.go-home", &["<Alt>Home"]);
         app.set_accels_for_action("win.open-path", &["<Control>l"]);
         app.set_accels_for_action("win.find", &["<Control>f"]);
+        app.set_accels_for_action("win.appearance", &["<Control>comma"]);
     }
 
     /// Actions for everything in §8's operation list, plus their accelerators.
@@ -888,9 +940,25 @@ impl Window {
     }
 
     /// Regenerate and apply the stylesheet from the current config.
+    ///
+    /// Swapping one `CssProvider`'s content restyles every widget in place: no
+    /// restart, no widget re-creation, and the file pane's model stack is never
+    /// touched, so switching flavors does not re-enumerate the directory.
     pub fn apply_theme(&self) {
         let config = self.config.borrow();
-        let palette = self.registry.get_or_default(&config.appearance.flavor);
+        let registry = self.registry.borrow();
+
+        let id = system::resolve(
+            &system::Preference {
+                flavor: &config.appearance.flavor,
+                follow_system: config.appearance.follow_system,
+                light_flavor: &config.appearance.light_flavor,
+                dark_flavor: &config.appearance.dark_flavor,
+            },
+            system::current(),
+        );
+
+        let palette = registry.get_or_default(id);
         let options = StyleOptions {
             accent: config.appearance.accent,
             client_side_rounding: config.appearance.client_side_rounding,
@@ -898,12 +966,92 @@ impl Window {
             animations: gtk::Settings::for_display(&WidgetExt::display(&self.window))
                 .is_gtk_enable_animations(),
         };
+
         ThemeProvider::sync_color_scheme(palette);
         self.theme.apply(palette, &options);
     }
 
+    /// The palette currently on screen, for the preferences dialog.
+    pub(crate) fn active_theme_id(&self) -> String {
+        let config = self.config.borrow();
+        system::resolve(
+            &system::Preference {
+                flavor: &config.appearance.flavor,
+                follow_system: config.appearance.follow_system,
+                light_flavor: &config.appearance.light_flavor,
+                dark_flavor: &config.appearance.dark_flavor,
+            },
+            system::current(),
+        )
+        .to_owned()
+    }
+
+    /// Switch flavor from the menu, live.
+    pub(crate) fn set_flavor(self: &Rc<Self>, id: &str) {
+        {
+            let mut config = self.config.borrow_mut();
+            if config.appearance.flavor == id {
+                return;
+            }
+            // Picking a flavor by hand is an explicit choice, and an explicit
+            // choice always wins — so it takes the app off follow-system rather
+            // than being silently ignored.
+            config.appearance.flavor = id.to_owned();
+            config.appearance.follow_system = false;
+        }
+
+        self.apply_theme();
+        self.save_config();
+
+        let name = self
+            .registry
+            .borrow()
+            .get(id)
+            .map(|palette| palette.name.to_string())
+            .unwrap_or_else(|| id.to_owned());
+        self.show_toast(&format!("Theme: {name}"));
+    }
+
+    /// Rebuild the Flavor submenu from the registry, marking the active one.
+    pub(crate) fn rebuild_flavor_menu(self: &Rc<Self>) {
+        self.flavor_menu.remove_all();
+
+        for palette in self.registry.borrow().all() {
+            let item = gio::MenuItem::new(Some(&palette.name), None);
+            item.set_action_and_target_value(
+                Some("win.flavor"),
+                Some(&palette.id.as_ref().to_variant()),
+            );
+            self.flavor_menu.append_item(&item);
+        }
+
+        let active = self.config.borrow().appearance.flavor.clone();
+        self.flavor_action.set_state(&active.to_variant());
+    }
+
+    /// Re-read `themes/` so a theme dropped in there appears without a restart.
+    pub(crate) fn reload_themes(self: &Rc<Self>) -> usize {
+        let reloaded = Registry::load(&crate::paths::themes_dir());
+        let failures = reloaded.errors().len();
+        for error in reloaded.errors() {
+            tracing::warn!(%error, "ignoring theme file");
+        }
+
+        let count = reloaded.all().len();
+        *self.registry.borrow_mut() = reloaded;
+        self.rebuild_flavor_menu();
+        self.apply_theme();
+
+        if failures > 0 {
+            self.show_toast(&format!(
+                "{count} themes loaded, {failures} skipped as unreadable"
+            ));
+        }
+        count
+    }
+
     /// Persist the config, reporting failures without interrupting the user.
-    fn save_config(&self) {
+    pub(crate) fn save_config(&self) {
         let path = crate::paths::config_file();
         if let Err(error) = config::save(&path, &self.config.borrow()) {
             tracing::warn!(%error, path = %path.display(), "could not save config");

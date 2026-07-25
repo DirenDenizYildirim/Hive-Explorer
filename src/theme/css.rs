@@ -171,9 +171,61 @@ window.background:backdrop {{
   color: {text};
 }}
 
+/* Concrete surfaces, not just custom properties.
+
+   A hand-written system GTK theme — the kind installed as
+   ~/.config/gtk-4.0/gtk.css — paints widgets with literal colours instead of
+   reading libadwaita's `--view-bg-color` and friends. Hive's `:root` block is
+   then simply never consulted, and no provider priority fixes that: the other
+   stylesheet is not asking a question Hive can answer. So every surface gets a
+   concrete declaration on the selector such a theme would target. Without
+   these, a light flavor half-applies — the file pane keeps the system theme's
+   dark background while everything around it turns light. */
+.view,
+iconview,
+columnview,
+listview,
+gridview,
+columnview > listview {{
+  background-color: {base};
+  color: {text};
+}}
+
+headerbar {{
+  background-color: {mantle};
+  color: {text};
+}}
+
+/* Header controls state their own colour too. Inheriting leaves them at the
+   system theme's foreground, which against a light flavor's header renders
+   pale-on-pale and effectively invisible. */
+headerbar button,
+headerbar button image,
+headerbar button label,
+headerbar menubutton > button image {{
+  color: {text};
+}}
+
+headerbar button:disabled,
+headerbar button:disabled image {{
+  color: {overlay0};
+}}
+
+popover > contents {{
+  background-color: {surface0};
+  color: {text};
+}}
+
+popover > arrow {{
+  background-color: {surface0};
+}}
+
 ",
         base = n.base.to_hex(),
         text = n.text.to_hex(),
+        mantle = n.mantle.to_hex(),
+        surface0 = n.surface0.to_hex(),
+        overlay0 = n.overlay0.to_hex(),
     );
 
     if !options.client_side_rounding || !options.client_side_shadow {
@@ -219,6 +271,16 @@ window.background:backdrop {{
 
 .hive-sidebar {{
   background-color: {mantle};
+  color: {text};
+}}
+
+/* Sidebar text is stated rather than inherited: a hand-written system theme
+   sets `.navigation-sidebar.background {{ color: … }}` concretely, and an
+   inherited colour loses to it however the window above is styled. */
+.hive-sidebar row,
+.hive-sidebar label,
+.hive-sidebar row label {{
+  color: {text};
 }}
 
 .hive-sidebar row {{
@@ -243,6 +305,7 @@ window.background:backdrop {{
 
 /* Breadcrumb: flat segments, one accent at a time. */
 .hive-breadcrumb button {{
+  color: {subtext0};
   padding: 2px 8px;
   min-height: 26px;
   border-radius: 6px;
@@ -373,6 +436,44 @@ window.background:backdrop {{
         );
     }
 
+    // The accent picker's swatches. Flat circles of the real colour, so the
+    // choice is made against the palette that is actually loaded.
+    let _ = write!(
+        css,
+        "
+/* Accent swatches. */
+.hive-swatch {{
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0;
+  border-radius: 50%;
+  background-image: none;
+  box-shadow: none;
+  border: 2px solid transparent;
+  outline: none;
+}}
+
+.hive-swatch:hover {{
+  border-color: {overlay1};
+}}
+
+.hive-swatch:checked {{
+  border-color: {text};
+}}
+",
+        overlay1 = n.overlay1.to_hex(),
+        text = n.text.to_hex(),
+    );
+
+    for slot in Accent::ALL {
+        let _ = writeln!(
+            css,
+            ".hive-swatch.hive-accent-{}{{background-color:{};}}",
+            slot.id(),
+            palette.accent(slot).to_hex()
+        );
+    }
+
     css
 }
 
@@ -417,6 +518,57 @@ mod tests {
                 palette.id
             );
         }
+    }
+
+    /// A hand-written system GTK theme paints widgets with literal colours and
+    /// never reads libadwaita's custom properties, so Hive has to declare the
+    /// same surfaces concretely. Setting only `--view-bg-color` left every
+    /// light flavor half-applied: sidebar light, file pane still dark.
+    #[test]
+    fn view_surfaces_are_declared_concretely_for_every_flavor() {
+        for palette in BUILT_IN {
+            let css = generate(palette, &opts(Accent::Mauve));
+            let base = palette.neutrals.base.to_hex();
+            let text = palette.neutrals.text.to_hex();
+
+            let block = block_containing(&css, ".view,").unwrap_or_else(|| {
+                panic!("{} has no concrete .view rule", palette.id);
+            });
+            assert!(
+                block.contains(&format!("background-color: {base};")),
+                "{} .view background is not concrete: {block}",
+                palette.id
+            );
+            assert!(
+                block.contains(&format!("color: {text};")),
+                "{} .view foreground is not concrete: {block}",
+                palette.id
+            );
+        }
+    }
+
+    #[test]
+    fn sidebar_text_colour_is_stated_not_inherited() {
+        for palette in BUILT_IN {
+            let css = generate(palette, &opts(Accent::Mauve));
+            let text = palette.neutrals.text.to_hex();
+            let block = block_containing(&css, ".hive-sidebar row,")
+                .unwrap_or_else(|| panic!("{} has no sidebar text rule", palette.id));
+            assert!(
+                block.contains(&format!("color: {text};")),
+                "{} sidebar text is not stated: {block}",
+                palette.id
+            );
+        }
+    }
+
+    /// The declaration block of the first rule whose selector list starts with
+    /// `selector`, so a test can assert about one rule rather than the file.
+    fn block_containing<'a>(css: &'a str, selector: &str) -> Option<&'a str> {
+        let start = css.find(selector)?;
+        let open = css[start..].find('{')? + start;
+        let close = css[open..].find('}')? + open;
+        Some(&css[open..=close])
     }
 
     #[test]
@@ -465,6 +617,22 @@ mod tests {
         let latte = generate(&LATTE, &opts(Accent::Blue));
         assert!(mocha.contains(".hive-folder-icon.hive-accent-mauve{color:#cba6f7;}"));
         assert!(latte.contains(".hive-folder-icon.hive-accent-mauve{color:#8839ef;}"));
+    }
+
+    #[test]
+    fn every_accent_gets_a_swatch_in_the_active_flavor() {
+        let mocha = generate(&MOCHA, &opts(Accent::Blue));
+        let latte = generate(&LATTE, &opts(Accent::Blue));
+
+        for slot in Accent::ALL {
+            let class = format!(".hive-swatch.hive-accent-{}", slot.id());
+            assert!(mocha.contains(&class), "{class} missing");
+        }
+
+        // The picker shows the colours of the flavor you are choosing within,
+        // so the same slot is a different swatch in a different flavor.
+        assert!(mocha.contains(".hive-swatch.hive-accent-mauve{background-color:#cba6f7;}"));
+        assert!(latte.contains(".hive-swatch.hive-accent-mauve{background-color:#8839ef;}"));
     }
 
     #[test]

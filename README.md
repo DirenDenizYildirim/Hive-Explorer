@@ -5,11 +5,11 @@ Minimal pastel explorer — a file manager for Hyprland, written in Rust with GT
 Priority order: **stability > visual polish > feature count.** A small set of operations that never fail is
 worth more than a wide feature set that occasionally corrupts or hangs.
 
-> **Status: milestones (a), (b) and (c) of 6.** The window, sidebar, theming system, config layer,
+> **Status: milestones (a), (b), (c) and (d) of 6.** The window, sidebar, theming system, config layer,
 > non-blocking progressive listing, navigation, full keyboard support, the CLI, and the whole file-operation
 > layer — copy, move, rename, trash, delete, undo, with conflict handling and pre-flight checks — are in
-> place. The theme switcher UI, folder colors, thumbnails and the properties dialog are not built yet. See
-> [Roadmap](#roadmap).
+> place, as is the theming UI — flavor switcher, live swapping, accent setting and follow-system. Folder
+> colors, pinning, thumbnails and the properties dialog are not built yet. See [Roadmap](#roadmap).
 
 ---
 
@@ -112,6 +112,8 @@ process (`gio::ApplicationFlags::HANDLES_OPEN`).
 | `Ctrl+A` | Select all |
 | `Ctrl+H` | Toggle hidden files |
 | `Ctrl+T` | Toggle list / grid view |
+| `Ctrl+,` | Appearance settings |
+| `F10` | Main menu (including the flavor switcher) |
 | `F9` | Toggle sidebar |
 | Arrows, `Home`/`End`, `Page Up`/`Down` | Move the selection |
 | Click-drag, `Ctrl+click`, `Shift+click` | Multi-select |
@@ -218,6 +220,56 @@ The four flavors are Rust constants. The stylesheet is generated at runtime and 
 `gtk::CssProvider` that is swapped on change — there are no hand-written per-flavor stylesheets to drift out
 of sync, and switching rebuilds no widgets.
 
+### Switching
+
+- **Menu → Flavor** switches immediately. `F10` opens the menu without a mouse.
+- **Menu → Appearance…**, or `Ctrl+,`, opens the full dialog: flavor, accent, follow-system, window chrome,
+  and your themes folder.
+
+Everything applies the moment you pick it. There is no OK button, because applying is the only way to see
+whether a theme is the one you wanted. Swapping the provider's content restyles the existing widgets in
+place — nothing is rebuilt and the directory is not re-read, so a switch does not lose your scroll position
+or selection.
+
+The **accent** is separate from the flavor and drives selection, focus rings, and the active sidebar row. The
+picker shows the fourteen slots in the colours of the flavor you are currently in, so you choose against what
+you will actually see.
+
+### Following the system
+
+Off by default. When on, Hive picks your chosen light flavor or dark flavor to match the desktop.
+
+The preference is read from the **freedesktop appearance portal**, not from libadwaita's `StyleManager`.
+`StyleManager::is_dark` reports the *effective* appearance, which Hive itself forces to match the active
+palette — asking it what the system wants only echoes back what Hive just told it.
+
+Three outcomes, and the last one is the common case on a bare Hyprland install:
+
+| The portal says | Hive uses |
+|---|---|
+| prefer dark | your dark flavor |
+| prefer light | your light flavor |
+| no preference, or no portal at all | **your configured flavor**, unchanged |
+
+"No preference" is a real answer and is not the same as light — guessing light would flip the theme on every
+machine without a desktop portal backend. An explicit flavor always wins and always works: picking one from
+the menu turns follow-system off rather than being silently overridden, and startup never waits on the portal.
+
+### A note on system GTK themes
+
+Hive's stylesheet loads one step above `GTK_STYLE_PROVIDER_PRIORITY_USER`, so it outranks a theme symlinked
+into `~/.config/gtk-4.0/gtk.css`. That is necessary but not sufficient.
+
+Hand-written GTK4 themes — the large generated ones, Catppuccin's own among them — paint widgets with
+**literal colours** rather than reading libadwaita's `--view-bg-color` and friends. Such a theme never asks
+Hive's question, so no provider priority can answer it: overriding a custom property does nothing when
+nothing reads it. Hive therefore declares every surface it cares about **concretely**, on the selectors such
+a theme targets, as well as setting the custom properties for libadwaita's own widgets.
+
+Without that, a light flavor half-applies: sidebar and header turn light while the file pane keeps the system
+theme's dark background and the sidebar labels keep its light text. If you write a theme for another toolkit
+and see something similar, this is why.
+
 ### Adding your own theme
 
 A theme is any file that fills the same slots the built-ins do. Drop a `.toml` into
@@ -271,6 +323,9 @@ Two rules worth knowing:
   That lets you adjust one flavor without ending up with a near-duplicate entry.
 
 A malformed theme file is skipped with a banner; it never blocks startup.
+
+**Reload** in the Appearance dialog re-reads the folder without restarting, so a theme you are editing can be
+checked by saving and clicking once. **Open** takes you to the folder in Hive itself, creating it if needed.
 
 ---
 
@@ -401,7 +456,8 @@ src/
              the undo stack and its re-validation, copy/move pre-flight,
              clipboard payload formats, trashinfo parsing               — no GTK, unit-tested
   config/    versioned schema, atomic writes, malformed-file recovery   — no GTK, unit-tested
-  theme/     palette types, Catppuccin constants, CSS generator       — no GTK except provider.rs
+  theme/     palette types, Catppuccin constants, CSS generator,
+             follow-system resolution                                 — no GTK except provider.rs
   fs/        places resolution, volume relevance, the off-thread
              operation worker, trashing and restoring                 — policy is plain Rust
   ui/        window, sidebar, breadcrumb, file pane, status bar,
@@ -504,7 +560,11 @@ Items marked *(a)* are verifiable now; the rest arrive with their milestone.
 - [ ] *(a)* Icons and text are crisp at `scale = 1.20`.
 - [ ] *(a)* A malformed file in `themes/` is skipped with a banner; Hive still starts.
 - [ ] *(a)* A user theme whose `id` matches a built-in replaces it in place.
-- [ ] Switching flavors applies live, with no restart, no flicker, and no view rebuild.
+- [ ] *(d)* Switching flavors applies live, with no restart, no flicker, and no view rebuild.
+- [ ] *(d)* A light flavor applies **completely** — file pane, sidebar text and header icons all follow.
+- [ ] *(d)* A theme dropped into `themes/` appears after Reload, without a restart.
+- [ ] *(d)* Changing the accent recolours selection and focus rings immediately.
+- [ ] *(d)* With follow-system on and no portal preference, the configured flavor stays put.
 - [ ] A folder colored `mauve` is Mocha mauve in Mocha and Latte mauve in Latte.
 
 **Config**

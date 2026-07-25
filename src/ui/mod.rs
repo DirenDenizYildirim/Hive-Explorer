@@ -9,6 +9,7 @@ pub mod file_pane;
 pub mod keys;
 pub mod operations;
 pub mod path_entry;
+pub mod preferences;
 pub mod progress;
 pub mod sidebar;
 pub mod status_bar;
