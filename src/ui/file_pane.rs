@@ -1,7 +1,7 @@
 //! The file pane: one model stack, two views.
 
-use std::cell::RefCell;
-use std::path::PathBuf;
+use std::cell::{Cell, RefCell};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -44,6 +44,14 @@ pub struct FilePane {
     state: Rc<RefCell<ViewState>>,
     column_view: gtk::ColumnView,
     grid_view: gtk::GridView,
+    /// A path to select once it appears.
+    ///
+    /// `--select` and Alt+Up both name a file that may not have been enumerated
+    /// yet — `DirectoryList` fills in progressively, so selecting eagerly would
+    /// usually miss. The request is retried as entries arrive and dropped when
+    /// loading finishes without it showing up.
+    pending_selection: RefCell<Option<PathBuf>>,
+    mode: Cell<ViewMode>,
 }
 
 impl FilePane {
@@ -135,6 +143,8 @@ impl FilePane {
             state,
             column_view,
             grid_view,
+            pending_selection: RefCell::new(None),
+            mode: Cell::new(ViewMode::List),
         })
     }
 
@@ -187,7 +197,113 @@ impl FilePane {
 
     /// Switch between list and grid. A stack page change only; nothing re-enumerates.
     pub fn set_view_mode(&self, mode: ViewMode) {
+        self.mode.set(mode);
         self.container.set_visible_child_name(mode.id());
+    }
+
+    pub fn view_mode(&self) -> ViewMode {
+        self.mode.get()
+    }
+
+    /// Move keyboard focus into whichever view is showing.
+    pub fn focus_view(&self) {
+        let focused = match self.mode.get() {
+            ViewMode::List => self.column_view.grab_focus(),
+            ViewMode::Grid => self.grid_view.grab_focus(),
+        };
+        if !focused {
+            tracing::debug!("file pane refused focus");
+        }
+    }
+
+    pub fn select_all(&self) {
+        self.selection.select_all();
+    }
+
+    pub fn unselect_all(&self) {
+        self.selection.unselect_all();
+    }
+
+    /// The first selected position, for type-ahead and keyboard movement.
+    pub fn selected_position(&self) -> Option<u32> {
+        let selection = self.selection.selection();
+        (0..self.selection.n_items()).find(|index| selection.contains(*index))
+    }
+
+    /// Select exactly one row and bring it into view.
+    pub fn select_only(&self, position: u32) {
+        if position >= self.selection.n_items() {
+            return;
+        }
+        self.selection.select_item(position, true);
+        self.scroll_to(position);
+    }
+
+    pub fn scroll_to(&self, position: u32) {
+        if position >= self.selection.n_items() {
+            return;
+        }
+        match self.mode.get() {
+            ViewMode::List => {
+                self.column_view
+                    .scroll_to(position, None, gtk::ListScrollFlags::FOCUS, None)
+            }
+            ViewMode::Grid => self
+                .grid_view
+                .scroll_to(position, gtk::ListScrollFlags::FOCUS, None),
+        }
+    }
+
+    /// Position of `path` in the current sorted, filtered view.
+    pub fn position_of_path(&self, path: &Path) -> Option<u32> {
+        (0..self.selection.n_items()).find(|index| {
+            self.file_at(*index)
+                .and_then(|file| file.path())
+                .is_some_and(|candidate| candidate == path)
+        })
+    }
+
+    /// Ask for `path` to be selected once it has been enumerated.
+    pub fn request_selection(&self, path: PathBuf) {
+        *self.pending_selection.borrow_mut() = Some(path);
+        self.apply_pending_selection();
+    }
+
+    /// Try to satisfy an outstanding selection request.
+    pub fn apply_pending_selection(&self) {
+        let Some(path) = self.pending_selection.borrow().clone() else {
+            return;
+        };
+
+        if let Some(position) = self.position_of_path(&path) {
+            self.pending_selection.borrow_mut().take();
+            self.select_only(position);
+            return;
+        }
+
+        // Enumeration finished and it never appeared: the file was deleted, or
+        // is filtered out. Drop the request rather than leaving it to fire on
+        // some later directory.
+        if !self.is_loading() {
+            tracing::debug!(path = %path.display(), "requested selection never appeared");
+            self.pending_selection.borrow_mut().take();
+        }
+    }
+
+    /// Clear any outstanding request, on navigating elsewhere.
+    pub fn clear_pending_selection(&self) {
+        self.pending_selection.borrow_mut().take();
+    }
+
+    /// Display names in view order, for type-ahead.
+    pub fn visible_names(&self) -> Vec<String> {
+        (0..self.selection.n_items())
+            .map(|index| {
+                self.info_at(index)
+                    .map(|info| display_name(&info))
+                    .unwrap_or_default()
+            })
+            .collect()
     }
 
     pub fn set_show_hidden(&self, show_hidden: bool) {
@@ -353,20 +469,25 @@ fn build_column_view(selection: &gtk::MultiSelection) -> gtk::ColumnView {
         .build();
 
     view.append_column(&name_column());
-    view.append_column(&text_column("Size", |info| {
+
+    let size_column = text_column("Size", |info| {
         if is_directory(info) {
             String::new()
         } else {
             crate::model::format::human_bytes(info.size().max(0) as u64)
         }
-    }));
-    view.append_column(&text_column("Modified", |info| {
+    });
+    view.append_column(&size_column);
+
+    let modified_column = text_column("Modified", |info| {
         info.modification_date_time()
             .and_then(|dt| dt.format("%Y-%m-%d %H:%M").ok())
             .map(|s| s.to_string())
             .unwrap_or_default()
-    }));
-    view.append_column(&text_column("Type", |info| {
+    });
+    view.append_column(&modified_column);
+
+    let type_column = text_column("Type", |info| {
         if is_directory(info) {
             "Folder".to_owned()
         } else {
@@ -377,7 +498,8 @@ fn build_column_view(selection: &gtk::MultiSelection) -> gtk::ColumnView {
                 gio::functions::content_type_get_description(&content).to_string()
             }
         }
-    }));
+    });
+    view.append_column(&type_column);
 
     view
 }

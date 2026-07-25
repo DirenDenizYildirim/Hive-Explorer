@@ -232,12 +232,12 @@ window.background:backdrop {{
   background-color: {surface0};
 }}
 
-.hive-sidebar row:selected {{
+.hive-sidebar row.hive-current {{
   background-color: {accent_soft};
   color: {text};
 }}
 
-.hive-sidebar row:selected image {{
+.hive-sidebar row.hive-current image {{
   color: {accent};
 }}
 

@@ -11,6 +11,9 @@ use crate::paths;
 use crate::theme::{Registry, ThemeProvider};
 use crate::ui::Window;
 
+/// Passed as the `open` hint to mean "reveal this, do not enter it".
+pub const REVEAL_HINT: &str = "select";
+
 /// Everything built once at startup and shared by every window.
 struct AppState {
     config: Rc<RefCell<Config>>,
@@ -55,14 +58,17 @@ pub fn build() -> adw::Application {
     {
         let state = Rc::clone(&state);
         let window = Rc::clone(&window);
-        app.connect_open(move |app, files, _hint| {
+        app.connect_open(move |app, files, hint| {
             let Some(state) = state.borrow().clone() else {
                 return;
             };
             let window = ensure_window(app, &state, &window);
 
+            // The hint carries the intent across the D-Bus handoff to an
+            // already-running instance, which plain argv cannot do.
+            let reveal = hint == REVEAL_HINT;
             match files.first() {
-                Some(file) => navigate_to_target(&window, file),
+                Some(file) => navigate_to_target(&window, file, reveal),
                 None => window.navigate_home(),
             }
             window.present();
@@ -162,25 +168,28 @@ fn ensure_window(
 }
 
 /// Navigate to a path from the command line.
-fn navigate_to_target(window: &Rc<Window>, file: &gio::File) {
+///
+/// A directory is opened. A file — or anything at all under `--select` — is
+/// revealed instead: its parent opens and the entry itself is preselected.
+fn navigate_to_target(window: &Rc<Window>, file: &gio::File, reveal: bool) {
     let Some(path) = file.path() else {
         window.navigate_to(file);
         return;
     };
 
-    if path.is_dir() {
+    if path.is_dir() && !reveal {
         window.navigate_to_path(&path);
         return;
     }
 
-    match path.parent() {
-        Some(parent) if parent.is_dir() => window.navigate_to_path(parent),
-        _ => {
-            tracing::warn!(path = %path.display(), "target is not reachable; showing home");
-            window.navigate_home();
-            window.show_banner(&format!("{} is not available", path.display()));
-        }
+    if !path.exists() {
+        tracing::warn!(path = %path.display(), "target does not exist; showing home");
+        window.navigate_home();
+        window.show_banner(&format!("{} is not available", path.display()));
+        return;
     }
+
+    window.reveal(&path);
 }
 
 fn describe_notice(notice: Option<&config::Notice>, path: &Path) -> Option<String> {

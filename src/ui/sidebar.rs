@@ -12,6 +12,9 @@ use crate::fs::volumes::{self, MountCandidate};
 /// How many recent files to list.
 const RECENT_LIMIT: usize = 8;
 
+/// Marks the row for the location currently being viewed.
+const CURRENT_ROW_CLASS: &str = "hive-current";
+
 type NavigateHandler = Rc<dyn Fn(gio::File)>;
 
 pub struct Sidebar {
@@ -37,7 +40,11 @@ impl Section {
         label.add_css_class("hive-section-label");
 
         let list = gtk::ListBox::new();
-        list.set_selection_mode(gtk::SelectionMode::Single);
+        // The highlight tracks the current location, which is not the same
+        // thing as a GTK selection: selection also moves on focus and on click,
+        // so a row could stay lit while the view was somewhere else entirely.
+        // Hive marks the current row with a class it controls instead.
+        list.set_selection_mode(gtk::SelectionMode::None);
         list.add_css_class("navigation-sidebar");
 
         container.append(&label);
@@ -48,6 +55,15 @@ impl Section {
     fn clear(&self) {
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
+        }
+    }
+
+    /// Drop the current-location marker from every row in this group.
+    fn clear_current(&self) {
+        let mut child = self.list.first_child();
+        while let Some(widget) = child {
+            widget.remove_css_class(CURRENT_ROW_CLASS);
+            child = widget.next_sibling();
         }
     }
 
@@ -337,7 +353,7 @@ impl Sidebar {
     /// Highlight the row matching `location`, clearing every other section.
     pub fn sync_selection(&self, location: Option<&gio::File>) {
         for section in [&self.pinned, &self.places, &self.recents, &self.devices] {
-            section.list.unselect_all();
+            section.clear_current();
         }
 
         let Some(location) = location else {
@@ -353,7 +369,7 @@ impl Sidebar {
             if place.path.as_deref() == Some(path.as_path())
                 && let Some(row) = self.places.list.row_at_index(index as i32)
             {
-                self.places.list.select_row(Some(&row));
+                row.add_css_class(CURRENT_ROW_CLASS);
                 return;
             }
         }

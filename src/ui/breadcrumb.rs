@@ -22,6 +22,7 @@ const CURRENT_WIDTH_CHARS: i32 = 24;
 
 pub struct Breadcrumb {
     container: gtk::Box,
+    viewport: gtk::ScrolledWindow,
     on_navigate: RefCell<Option<NavigateHandler>>,
 }
 
@@ -31,14 +32,29 @@ impl Breadcrumb {
         container.add_css_class("hive-breadcrumb");
         container.set_valign(gtk::Align::Center);
 
+        // The trail must never dictate how narrow the window can be. Collapsing
+        // and ellipsizing bound how *wide* it gets, but a Box still reports the
+        // sum of its children as its minimum, and through the header bar that
+        // becomes the whole window's minimum — which a tiling compositor is
+        // under no obligation to honour. A viewport with
+        // propagate_natural_width(false) reports ~0 instead.
+        let viewport = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::External)
+            .vscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_width(false)
+            .hexpand(true)
+            .child(&container)
+            .build();
+
         Rc::new(Self {
             container,
+            viewport,
             on_navigate: RefCell::new(None),
         })
     }
 
-    pub fn widget(&self) -> &gtk::Box {
-        &self.container
+    pub fn widget(&self) -> &gtk::ScrolledWindow {
+        &self.viewport
     }
 
     pub fn connect_navigate(self: &Rc<Self>, handler: impl Fn(gio::File) + 'static) {
@@ -111,6 +127,15 @@ impl Breadcrumb {
                 }
             }
         }
+
+        // The viewport can clip when the window is very narrow. Scroll to the
+        // end so what gets clipped is the ancestors, never the directory the
+        // user is actually in. Deferred, because the adjustment's upper bound
+        // is not known until the new buttons have been allocated.
+        let adjustment = self.viewport.hadjustment();
+        glib::idle_add_local_once(move || {
+            adjustment.set_value(adjustment.upper());
+        });
     }
 
     /// The `…` button standing in for collapsed middle segments.

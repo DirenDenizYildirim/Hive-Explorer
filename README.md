@@ -5,9 +5,9 @@ Minimal pastel explorer — a file manager for Hyprland, written in Rust with GT
 Priority order: **stability > visual polish > feature count.** A small set of operations that never fail is
 worth more than a wide feature set that occasionally corrupts or hangs.
 
-> **Status: milestone (a) of 6.** The window, sidebar, theming system, config layer, and the non-blocking
-> progressive directory listing are in place. File operations, undo, folder colors, and thumbnails are not
-> built yet. See [Roadmap](#roadmap).
+> **Status: milestones (a) and (b) of 6.** The window, sidebar, theming system, config layer, non-blocking
+> progressive listing, navigation, full keyboard support, and the CLI are in place. File operations, undo,
+> folder colors, and thumbnails are not built yet. See [Roadmap](#roadmap).
 
 ---
 
@@ -98,18 +98,37 @@ process (`gio::ApplicationFlags::HANDLES_OPEN`).
 
 ## Keybindings
 
-Implemented in milestone (a):
-
 | Key | Action |
 |---|---|
+| `Double-click` / `Enter` | Enter a directory, or open a file in its handler application |
+| `Alt+Left` / `Alt+Right` | Back / forward through history |
+| Mouse buttons 8 / 9 | Back / forward |
+| `Alt+Up` / `Backspace` | Parent folder (selects the folder you came from) |
+| `Alt+Home` | Home |
+| `Ctrl+L` | Path entry — `Tab` completes, `Enter` goes, `Escape` cancels |
+| `Ctrl+F` | Filter this folder as you type; `Escape` clears and closes |
+| `Ctrl+A` | Select all |
 | `Ctrl+H` | Toggle hidden files |
 | `Ctrl+T` | Toggle list / grid view |
 | `F9` | Toggle sidebar |
-| `Double-click` / `Enter` | Enter a directory |
+| Arrows, `Home`/`End`, `Page Up`/`Down` | Move the selection |
+| Type any letters | Type-ahead jump to the next matching name |
 
-Planned for later milestones: `Alt+Left`/`Alt+Right` history, `Alt+Up`/`Backspace` parent, `Ctrl+L` path entry,
-`Ctrl+F` filter, `Ctrl+A` select all, `Del` trash, `Shift+Del` permanent delete, `Ctrl+Z` undo, `F2` rename,
-and optional vim-style `hjkl` navigation.
+Type-ahead is why `Ctrl+F` is an explicit shortcut rather than start-typing-to-search: bare typing jumps to a
+name, and only `Ctrl+F` opens the filter.
+
+### Vim keys
+
+Off by default. Set `vim_keys = true` under `[behavior]`:
+
+| Key | Action |
+|---|---|
+| `j` / `k` | Down / up |
+| `h` | Parent folder |
+| `l` | Enter / open |
+| `gg` / `G` | First / last entry |
+
+Still planned: `Del` trash, `Shift+Del` permanent delete, `Ctrl+Z` undo, `F2` rename, `Ctrl+C`/`X`/`V`.
 
 ---
 
@@ -368,6 +387,19 @@ Items marked *(a)* are verifiable now; the rest arrive with their milestone.
 - [ ] Files that vanish mid-operation are handled without a crash.
 - [ ] An unresponsive network mount never freezes the UI.
 
+**Navigation**
+
+- [ ] `Alt+Left`/`Alt+Right` walk history; the buttons grey out at each end.
+- [ ] Navigating somewhere new after going back discards the forward trail.
+- [ ] `Alt+Up` goes to the parent and selects the folder you just left.
+- [ ] Mouse side buttons go back and forward.
+- [ ] `Ctrl+L` shows the path; `Tab` completes a unique match and appends `/`.
+- [ ] `Ctrl+L` then `Escape` restores the breadcrumb and returns focus to the list.
+- [ ] `Ctrl+F` filters as you type; `Escape` clears the filter, not just the box.
+- [ ] Typing letters with the list focused jumps to the next matching name.
+- [ ] Double-clicking a file opens it in the right application.
+- [ ] `hive --select FILE` from a second terminal reveals it in the running window, with no second process.
+
 **Layout under a tiling compositor**
 
 - [ ] *(a)* Usable at 500×400: nothing clipped, unreachable, or overflowing.
@@ -416,7 +448,9 @@ Items marked *(a)* are verifiable now; the rest arrive with their milestone.
 
 - **(a) — done.** Window, sidebar, progressive non-blocking directory listing, theme constants + generator +
   `CssProvider`, config load/save with tests, `adw::Application` with `HANDLES_OPEN`.
-- **(b)** Navigation and full keyboard support; CLI and single-instance behavior.
+- **(b) — done.** History with back/forward, parent, mouse side buttons, `Ctrl+L` path entry with tab
+  completion, `Ctrl+F` filter, `Ctrl+A`, type-ahead, optional vim keys, opening files through `gio::AppInfo`,
+  `--select` reveal, and single-instance handoff.
 - **(c)** File operations with conflict handling, progress and cancel, copy/move pre-flight, and undo.
 - **(d)** Theming UI: flavor switcher, live swap, accent setting, follow-system, user-theme directory.
 - **(e)** Folder colors and sidebar pinning.

@@ -52,7 +52,7 @@ fn main() -> glib::ExitCode {
 
     match target {
         Some(path) => {
-            let hint = if args.reveal { "select" } else { "" };
+            let hint = if args.reveal { app::REVEAL_HINT } else { "" };
             application.open(&[gio::File::for_path(&path)], hint);
         }
         None => application.activate(),
@@ -60,8 +60,13 @@ fn main() -> glib::ExitCode {
 
     if application.is_remote() {
         tracing::debug!("handed off to the running instance");
-        return glib::ExitCode::SUCCESS;
     }
 
+    // Run even when remote. The dispatch above has already delivered the target,
+    // and for a remote instance `run` returns straight away — but it is also
+    // what tears the D-Bus registration down cleanly. Returning early instead
+    // leaves the application finalized while still registered, which GIO warns
+    // about on stderr. The extra `activate` it emits is harmless: the primary
+    // instance just presents the window it already has.
     application.run_with_args::<&str>(&[program.to_string_lossy().as_ref()])
 }
