@@ -9,6 +9,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 
 use crate::fs::open;
+use crate::ui::color_picker;
 use crate::ui::window::Window;
 
 /// Roughly one row down from the top of the pane, for the keyboard-opened menu.
@@ -46,6 +47,7 @@ pub fn install(window: &Rc<Window>) {
             };
 
             by_pointer.set_menu_model(Some(&model));
+            attach_color_picker(&this, &by_pointer);
             by_pointer.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
             by_pointer.popup();
         });
@@ -61,6 +63,7 @@ pub fn install(window: &Rc<Window>) {
             folder_menu()
         };
         popover.set_menu_model(Some(&model));
+        attach_color_picker(&this, &popover);
 
         // There is no pointer position to use, so anchor it near the top of the
         // pane. Leaving the rectangle unset lets it inherit the last click.
@@ -81,6 +84,21 @@ fn selection_menu(window: &Rc<Window>) -> gio::Menu {
         open.append_submenu(Some("Open With"), &submenu);
     }
     menu.append_section(None, &open);
+
+    // Colouring and pinning are folder-only, so the entries appear only when
+    // there is a folder in the selection rather than sitting there greyed out.
+    let folders = window.file_pane.selected_directories();
+    if !folders.is_empty() {
+        let folder = gio::Menu::new();
+        folder.append_submenu(Some("Color"), &color_menu());
+
+        if folders.iter().all(|path| window.is_pinned(path)) {
+            folder.append(Some("Unpin from Sidebar"), Some("win.unpin"));
+        } else {
+            folder.append(Some("Pin to Sidebar"), Some("win.pin"));
+        }
+        menu.append_section(None, &folder);
+    }
 
     let clipboard = gio::Menu::new();
     clipboard.append(Some("Cut"), Some("win.cut"));
@@ -120,6 +138,31 @@ fn folder_menu() -> gio::Menu {
     menu.append_section(None, &view);
 
     menu
+}
+
+/// A submenu holding nothing but a placeholder for the swatch grid.
+fn color_menu() -> gio::Menu {
+    let menu = gio::Menu::new();
+    let item = gio::MenuItem::new(None, None);
+    item.set_attribute_value("custom", Some(&color_picker::CUSTOM_ID.to_variant()));
+    menu.append_item(&item);
+    menu
+}
+
+/// Put the real swatch grid where the placeholder is.
+///
+/// `GtkPopoverMenu` builds its widgets from the model, so this has to run after
+/// every `set_menu_model` — and with a fresh grid each time, because the one
+/// from the previous model has been torn down along with it.
+fn attach_color_picker(window: &Rc<Window>, popover: &gtk::PopoverMenu) {
+    if window.file_pane.selected_directories().is_empty() {
+        return;
+    }
+
+    let picker = color_picker::build(window, popover);
+    if !popover.add_child(&picker, color_picker::CUSTOM_ID) {
+        tracing::warn!("could not place the folder-color swatches in the menu");
+    }
 }
 
 /// Applications registered for the first selected file.

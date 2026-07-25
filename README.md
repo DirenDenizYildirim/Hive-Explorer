@@ -5,11 +5,12 @@ Minimal pastel explorer — a file manager for Hyprland, written in Rust with GT
 Priority order: **stability > visual polish > feature count.** A small set of operations that never fail is
 worth more than a wide feature set that occasionally corrupts or hangs.
 
-> **Status: milestones (a), (b), (c) and (d) of 6.** The window, sidebar, theming system, config layer,
+> **Status: milestones (a) through (e) of 6.** The window, sidebar, theming system, config layer,
 > non-blocking progressive listing, navigation, full keyboard support, the CLI, and the whole file-operation
 > layer — copy, move, rename, trash, delete, undo, with conflict handling and pre-flight checks — are in
-> place, as is the theming UI — flavor switcher, live swapping, accent setting and follow-system. Folder
-> colors, pinning, thumbnails and the properties dialog are not built yet. See [Roadmap](#roadmap).
+> place, as is the theming UI — flavor switcher, live swapping, accent setting and follow-system — and now
+> folder colors and sidebar pinning. Thumbnails and the properties dialog are not built yet.
+> See [Roadmap](#roadmap).
 
 ---
 
@@ -201,10 +202,14 @@ vim_keys = false
 pinned = []
 ```
 
+`pinned` under `[sidebar]` is the pinned-folder list, in the order the sidebar shows them. It is normalized on
+read: duplicates and relative paths are dropped, so hand-editing it cannot produce two rows for one folder.
+
 Other locations:
 
 | | |
 |---|---|
+| Folder colors | `$XDG_CONFIG_HOME/hive/folder-colors.toml` |
 | Thumbnail cache | `$XDG_CACHE_HOME/hive/thumbnails/` |
 | Logs | `$XDG_STATE_HOME/hive/logs/` (daily rotation, 5 files kept) |
 | User themes | `$XDG_CONFIG_HOME/hive/themes/` |
@@ -329,6 +334,47 @@ checked by saving and clicking once. **Open** takes you to the folder in Hive it
 
 ---
 
+## Folder colors
+
+Right-click a folder → **Color** → a grid of the fourteen accent slots, plus **None**. The swatches are drawn
+in the colors of the flavor that is loaded, so what you pick is what you get. The whole selection is colored
+at once, and the change applies immediately in both the file pane and the sidebar.
+
+The color tints **the folder's symbolic icon only** — never the row background, never the label.
+
+- **Stored by slot name, never as hex**, in `$XDG_CONFIG_HOME/hive/folder-colors.toml`, keyed by absolute
+  path. A folder tagged `mauve` is Mocha mauve in Mocha and Latte mauve in Latte, and it still resolves under
+  a user theme that maps its own colors onto the same fourteen slots.
+- **Nothing is ever written into your folders.** No `.directory`, no dotfiles, no xattrs. If you delete
+  `folder-colors.toml`, every folder goes back to plain and nothing else is affected.
+- The context-menu entry appears only when the selection contains a folder, rather than sitting there greyed
+  out.
+
+Reachable without a mouse: `Menu` or `Shift+F10` opens the context menu, arrows walk to **Color**, `Return`
+opens the grid, arrows move between swatches, `Return` applies.
+
+---
+
+## Pinned folders
+
+The **Pinned** section sits at the top of the sidebar and persists in `config.toml`.
+
+- **Pin:** right-click a folder → **Pin to Sidebar**, or drag it from the file pane onto the sidebar.
+- **Reorder:** drag a pinned row up or down. Dropping on the upper half of a row lands above it, the lower
+  half below it, so the bottom of the list is reachable.
+- **Unpin:** right-click a pinned row → **Unpin**, or right-click the folder in the pane →
+  **Unpin from Sidebar**.
+
+Pinned rows carry the folder's color, which is what makes a long list scannable at a glance.
+
+**Dragging is deliberately Hive-only.** The payload is a private boxed type, not a `GFile` or a
+`text/uri-list`, so no other application can accept the drag. Dragging files *out* to other applications is
+deferred to v1.1, and half of it working by accident would be worse than none of it. The cost is that
+starting a drag on a folder row no longer starts a rubber-band selection there — begin the rubber band on
+empty space instead, exactly as in every other file manager.
+
+---
+
 ## Hyprland window rules
 
 ```conf
@@ -434,6 +480,22 @@ accident.
 | 7 | **Symlink copy semantics** | **Default: copy the link itself, not its target** (`NOFOLLOW_SYMLINKS`), so a broken link copies as a broken link rather than failing. Set `follow_symlinks_on_copy = true` under `[behavior]` to copy targets instead; there is no per-operation modifier, because a destructive default that changes with a held key is exactly the implicit behavior the spec rules out. | done |
 | 8 | **Self-referential operations** | Renaming or deleting the directory currently being viewed walks up to the **nearest surviving ancestor** rather than sitting on a dead path or jumping all the way Home. Cut-then-paste into the same directory is a no-op, not a duplicate and not a deletion. Copying or moving a folder into its own subtree, or onto itself, is refused before a single byte moves. | done |
 
+Three more that folder colors and pinning brought with them:
+
+- **A colored folder that is renamed or moved loses its color.** Colors are keyed by absolute path, and Hive
+  does not follow a rename. The stale entry is ignored on read and pruned lazily — when the directory it
+  named is next listed, those few paths are checked for existence off the main thread and the dead ones
+  dropped. There is no startup scan and nothing walks a tree. The visible consequence: create a new folder
+  with the same name in the same place before that directory is revisited and it inherits the old color.
+  *If you would rather colors followed a rename, say so — it is a small change, but it is not what the build
+  spec asked for.*
+- **A folder whose name is not valid UTF-8 cannot be colored.** A TOML key is text, and writing a lossy
+  approximation of the name would eventually color some *other* folder. Hive refuses and says so in a toast
+  rather than storing a color that silently applies to the wrong thing.
+- **A pinned folder that no longer exists is dimmed, not removed.** The pinned list is yours; Hive does not
+  edit it on your behalf. The row goes italic and grey with "not found" in its tooltip, and right-click →
+  Unpin removes it when you decide to.
+
 Two more decisions that are already live in milestone (a):
 
 - **Places that point nowhere are omitted.** Each place resolves via `glib::user_special_dir()`, falls back to
@@ -454,14 +516,18 @@ Two more decisions that are already live in milestone (a):
 src/
   model/     sort comparators, filter predicate, path normalization,
              the undo stack and its re-validation, copy/move pre-flight,
-             clipboard payload formats, trashinfo parsing               — no GTK, unit-tested
-  config/    versioned schema, atomic writes, malformed-file recovery   — no GTK, unit-tested
+             clipboard payload formats, trashinfo parsing, the pinned
+             list and its reordering                                  — no GTK, unit-tested
+  config/    versioned schema, atomic writes, malformed-file recovery  — no GTK, unit-tested
+  colors/    the folder-color store: slot names by absolute path,
+             lenient reads, lazy pruning                              — no GTK, unit-tested
   theme/     palette types, Catppuccin constants, CSS generator,
              follow-system resolution                                 — no GTK except provider.rs
   fs/        places resolution, volume relevance, the off-thread
              operation worker, trashing and restoring                 — policy is plain Rust
   ui/        window, sidebar, breadcrumb, file pane, status bar,
-             clipboard, dialogs, progress, context menu               — GTK layer, holds no policy
+             clipboard, dialogs, progress, context menu, the colour
+             picker and the pin drag payload                          — GTK layer, holds no policy
   app.rs     adw::Application, HANDLES_OPEN, startup
   cli.rs     argument parsing                                         — unit-tested
 ```
@@ -487,7 +553,9 @@ decide what you see without needing a display.
 **`std::fs` carve-out.** User-facing filesystem work goes through `gio`, so trash, mounts, URI handling, and
 monitoring match the rest of the desktop. Three modules are exempt and use `std::fs`: `config`, the
 folder-color store, and the read-only theme-registry scan. All three must stay GTK/gio-free to remain
-unit-testable without a display, and all three touch only Hive's own config area.
+unit-testable without a display, and all three touch only Hive's own config area. `config` and `colors` share
+one write-then-rename helper (`config::atomic`) rather than each carrying its own copy — an atomic write is
+exactly the code that must not drift between two callers.
 
 ---
 
@@ -516,7 +584,7 @@ files and directories. Python 3 stdlib only.
 
 ### Manual QA checklist
 
-Items marked *(a)* are verifiable now; the rest arrive with their milestone.
+Every item marked *(a)* through *(e)* is verifiable now; the rest arrive with their milestone.
 
 **Listing and stability**
 
@@ -565,7 +633,31 @@ Items marked *(a)* are verifiable now; the rest arrive with their milestone.
 - [ ] *(d)* A theme dropped into `themes/` appears after Reload, without a restart.
 - [ ] *(d)* Changing the accent recolours selection and focus rings immediately.
 - [ ] *(d)* With follow-system on and no portal preference, the configured flavor stays put.
-- [ ] A folder colored `mauve` is Mocha mauve in Mocha and Latte mauve in Latte.
+- [ ] *(e)* A folder colored `mauve` is Mocha mauve in Mocha and Latte mauve in Latte.
+
+**Folder colors**
+
+- [ ] *(e)* Right-click a folder → Color shows the fourteen swatches in the loaded flavor, plus None.
+- [ ] *(e)* Picking a color repaints the icon immediately, in the pane and in the sidebar, with a toast.
+- [ ] *(e)* None clears the color.
+- [ ] *(e)* Coloring a multi-selection colors all of them in one go.
+- [ ] *(e)* Colors survive a restart, and only the icon is tinted — not the row, not the label.
+- [ ] *(e)* Deleting a colored folder drops its entry the next time that directory is listed.
+- [ ] *(e)* A folder whose name is invalid UTF-8 refuses with an explanation instead of failing silently.
+- [ ] *(e)* Nothing appears inside the folders themselves — no `.directory`, no dotfiles, no xattrs.
+- [ ] *(e)* The Color grid is reachable and operable from the keyboard alone.
+
+**Pinning**
+
+- [ ] *(e)* Right-click a folder → Pin to Sidebar adds it, with a toast, and it survives a restart.
+- [ ] *(e)* Dragging a folder from the pane onto the sidebar pins it, including when nothing is pinned yet.
+- [ ] *(e)* Dragging a pinned row up or down reorders it, and the order survives a restart.
+- [ ] *(e)* Dropping on the lower half of the last row moves an item to the end of the list.
+- [ ] *(e)* Right-click a pinned row → Unpin removes it.
+- [ ] *(e)* Unpin from Sidebar in the pane's context menu removes it.
+- [ ] *(e)* A pinned folder that no longer exists is dimmed rather than deleted, and can still be unpinned.
+- [ ] *(e)* Dragging a folder over another application refuses the drop — Hive's drags stay inside Hive.
+- [ ] *(e)* Rubber-band selection still works when started on empty space in the pane.
 
 **Config**
 
@@ -616,8 +708,10 @@ Items marked *(a)* are verifiable now; the rest arrive with their milestone.
   file, all on a worker thread with progress and cancel; the copy/move pre-flight checks; conflict handling;
   and a 20-entry undo stack with re-validation. Clipboard interop with other file managers, and the trash,
   case-only-rename, symlink and self-reference hazards.
-- **(d)** Theming UI: flavor switcher, live swap, accent setting, follow-system, user-theme directory.
-- **(e)** Folder colors and sidebar pinning.
+- **(d) — done.** Theming UI: flavor switcher, live swap, accent setting, follow-system, user-theme
+  directory.
+- **(e) — done.** Folder colors stored by accent slot with lazy pruning, and sidebar pinning with
+  drag-to-pin, drag-to-reorder and right-click unpin.
 - **(f)** Polish: thumbnails, properties dialog with opt-in cancellable recursive size, status line, animations.
 
 Deliberately out of scope for v1: tabs, split panes, terminal embedding, archive management, network-mount UI,

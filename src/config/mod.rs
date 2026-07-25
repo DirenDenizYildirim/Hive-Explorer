@@ -1,5 +1,6 @@
 //! Persistent configuration.
 
+pub mod atomic;
 pub mod defaults;
 
 use std::path::{Path, PathBuf};
@@ -214,20 +215,10 @@ impl Loaded {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SaveError {
-    #[error("could not create config directory {path}: {source}")]
-    CreateDir {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
     #[error("could not serialize config: {0}")]
     Serialize(#[from] toml::ser::Error),
-    #[error("could not write config to {path}: {source}")]
-    Write {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Write(#[from] atomic::WriteError),
 }
 
 /// Load the config at `path`.
@@ -299,17 +290,12 @@ fn recover(path: &Path, original: &str, reason: String) -> Loaded {
 }
 
 fn back_up(path: &Path, contents: &str) -> Result<PathBuf, String> {
-    let backup = backup_path(path);
-    std::fs::write(&backup, contents)
-        .map(|()| backup.clone())
-        .map_err(|error| format!("could not write {}: {error}", backup.display()))
+    atomic::back_up(path, contents)
 }
 
 /// `config.toml` -> `config.toml.bak`.
 pub fn backup_path(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(".bak");
-    PathBuf::from(name)
+    atomic::backup_path(path)
 }
 
 /// Bring an older config forward. No-op at v1.
@@ -320,49 +306,9 @@ fn migrate(mut config: Config) -> Config {
 
 /// Write `config` to `path` atomically.
 pub fn save(path: &Path, config: &Config) -> Result<(), SaveError> {
-    use std::io::Write as _;
-
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|source| SaveError::CreateDir {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-
     let text = toml::to_string_pretty(config)?;
-
-    let temp = temp_path(path);
-    {
-        let mut file = std::fs::File::create(&temp).map_err(|source| SaveError::Write {
-            path: temp.clone(),
-            source,
-        })?;
-        file.write_all(text.as_bytes())
-            .map_err(|source| SaveError::Write {
-                path: temp.clone(),
-                source,
-            })?;
-        file.sync_all().map_err(|source| SaveError::Write {
-            path: temp.clone(),
-            source,
-        })?;
-    }
-
-    std::fs::rename(&temp, path).map_err(|source| {
-        let _ = std::fs::remove_file(&temp);
-        SaveError::Write {
-            path: path.to_path_buf(),
-            source,
-        }
-    })
-}
-
-fn temp_path(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(".tmp");
-    PathBuf::from(name)
+    atomic::write(path, &text)?;
+    Ok(())
 }
 
 fn lenient_accent<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Accent, D::Error> {

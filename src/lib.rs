@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod cli;
+pub mod colors;
 pub mod config;
 pub mod fs;
 pub mod logging;

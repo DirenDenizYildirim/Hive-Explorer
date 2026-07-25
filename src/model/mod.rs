@@ -7,6 +7,7 @@ pub mod format;
 pub mod history;
 pub mod naming;
 pub mod path;
+pub mod pins;
 pub mod preflight;
 pub mod sort;
 pub mod trashinfo;

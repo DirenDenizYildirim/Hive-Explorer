@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
+use crate::colors;
 use crate::config::{self, Config, ViewMode, defaults};
 use crate::fs::open;
 use crate::model::History;
@@ -31,7 +32,7 @@ type WindowAction = Box<dyn Fn(&Rc<Window>)>;
 pub struct Window {
     pub(crate) window: adw::ApplicationWindow,
     pub(crate) file_pane: Rc<FilePane>,
-    sidebar: Rc<Sidebar>,
+    pub(crate) sidebar: Rc<Sidebar>,
     breadcrumb: Rc<Breadcrumb>,
     status: Rc<StatusBar>,
     banner: adw::Banner,
@@ -39,6 +40,8 @@ pub struct Window {
     split: adw::OverlaySplitView,
     pub(crate) config: Rc<RefCell<Config>>,
     pub(crate) registry: Rc<RefCell<Registry>>,
+    /// Folder colors, by accent slot and absolute path.
+    pub(crate) colors: Rc<RefCell<colors::Store>>,
     theme: ThemeProvider,
     status_debouncer: RefCell<Option<Debouncer>>,
     history: RefCell<History<String>>,
@@ -68,6 +71,7 @@ impl Window {
         app: &adw::Application,
         config: Rc<RefCell<Config>>,
         registry: Rc<RefCell<Registry>>,
+        colors: Rc<RefCell<colors::Store>>,
         theme: ThemeProvider,
     ) -> Rc<Self> {
         let (filter_spec, sort_spec, view_mode) = {
@@ -83,10 +87,10 @@ impl Window {
             )
         };
 
-        let file_pane = FilePane::new(filter_spec, sort_spec);
+        let file_pane = FilePane::new(filter_spec, sort_spec, Rc::clone(&colors));
         file_pane.set_view_mode(view_mode);
 
-        let sidebar = Sidebar::new();
+        let sidebar = Sidebar::new(Rc::clone(&config), Rc::clone(&colors));
         let breadcrumb = Breadcrumb::new();
         let status = Rc::new(StatusBar::new());
 
@@ -130,7 +134,7 @@ impl Window {
         toolbar.set_content(Some(&toasts));
 
         let split = adw::OverlaySplitView::builder()
-            .sidebar(&sidebar.widget())
+            .sidebar(sidebar.widget())
             .content(&toolbar)
             .max_sidebar_width(f64::from(defaults::SIDEBAR_WIDTH_PX))
             .min_sidebar_width(200.0)
@@ -184,6 +188,7 @@ impl Window {
             split,
             config,
             registry,
+            colors,
             theme,
             status_debouncer: RefCell::new(None),
             history: RefCell::new(History::empty()),
@@ -206,6 +211,7 @@ impl Window {
 
         this.build_header(&header);
         this.wire_navigation();
+        this.wire_folders();
         this.wire_search();
         this.wire_path_entry();
         this.wire_status();

@@ -7,9 +7,12 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::glib::clone;
 
+use crate::colors;
 use crate::config::ViewMode;
 use crate::model::filter::{self, FilterInput, FilterSpec};
 use crate::model::sort::{self, SortKeyData, SortSpec};
+use crate::theme::palette::Accent;
+use crate::ui::dnd::FolderDrag;
 
 /// Attributes requested from every entry.
 const ATTRIBUTES: &str = concat!(
@@ -32,6 +35,20 @@ struct ViewState {
     filter: FilterSpec,
     sort: SortSpec,
 }
+
+/// The rows that currently have a widget, weakly held.
+///
+/// Recolouring a folder has to repaint what is already on screen, and a
+/// `GtkListView` will not re-bind a row on request — nothing about the model
+/// changed, so nothing tells it to. Rather than force a rebuild, each factory
+/// registers its list items here as they are set up and drops them at teardown,
+/// so a colour change can walk the handful of live rows and restyle exactly
+/// them. Weak references, so a row that GTK discards without a teardown cannot
+/// keep a widget alive.
+type LiveRows = Rc<RefCell<Vec<glib::WeakRef<gtk::ListItem>>>>;
+
+/// Shared folder-color lookup, read on every bind.
+type Colors = Rc<RefCell<colors::Store>>;
 
 pub struct FilePane {
     /// A plain box wrapping the view stack.
@@ -64,10 +81,12 @@ pub struct FilePane {
     /// point, so the rows report themselves: the row gesture runs first in the
     /// bubble phase and leaves its position here for the view gesture to take.
     right_clicked: Rc<Cell<Option<u32>>>,
+    colors: Colors,
+    rows: LiveRows,
 }
 
 impl FilePane {
-    pub fn new(filter_spec: FilterSpec, sort_spec: SortSpec) -> Rc<Self> {
+    pub fn new(filter_spec: FilterSpec, sort_spec: SortSpec, colors: Colors) -> Rc<Self> {
         let state = Rc::new(RefCell::new(ViewState {
             filter: filter_spec,
             sort: sort_spec,
@@ -136,8 +155,9 @@ impl FilePane {
         let selection = gtk::MultiSelection::new(Some(sort_model.clone()));
 
         let right_clicked = Rc::new(Cell::new(None));
-        let column_view = build_column_view(&selection, &right_clicked);
-        let grid_view = build_grid_view(&selection, &right_clicked);
+        let rows: LiveRows = Rc::new(RefCell::new(Vec::new()));
+        let column_view = build_column_view(&selection, &right_clicked, &colors, &rows);
+        let grid_view = build_grid_view(&selection, &right_clicked, &colors, &rows);
 
         let stack = gtk::Stack::new();
         stack.set_transition_type(gtk::StackTransitionType::None);
@@ -163,6 +183,8 @@ impl FilePane {
             pending_selection: RefCell::new(None),
             mode: Cell::new(ViewMode::List),
             right_clicked,
+            colors,
+            rows,
         })
     }
 
@@ -369,6 +391,29 @@ impl FilePane {
         self.state.borrow().sort
     }
 
+    /// Repaint the folder icons of every row currently on screen.
+    ///
+    /// Called after a colour changes. Dead weak references are dropped on the
+    /// way past, so a session that scrolls through a great many rows does not
+    /// accumulate them.
+    pub fn refresh_folder_colors(&self) {
+        let Ok(mut rows) = self.rows.try_borrow_mut() else {
+            return;
+        };
+        rows.retain(|weak| match weak.upgrade() {
+            Some(item) => {
+                apply_folder_color(&item, &self.colors);
+                true
+            }
+            None => false,
+        });
+    }
+
+    /// Paths of the selected entries that are directories, in view order.
+    pub fn selected_directories(&self) -> Vec<PathBuf> {
+        selected_directories(&self.selection)
+    }
+
     /// Paths of the selected entries, in view order.
     pub fn selected_paths(&self) -> Vec<PathBuf> {
         let selection = self.selection.selection();
@@ -506,6 +551,136 @@ fn scrolled(child: &impl IsA<gtk::Widget>) -> gtk::ScrolledWindow {
         .build()
 }
 
+/// Remember a row so its folder colour can be repainted later.
+fn register_row(rows: &LiveRows, item: &gtk::ListItem) {
+    if let Ok(mut rows) = rows.try_borrow_mut() {
+        rows.push(item.downgrade());
+    }
+}
+
+/// Forget a row GTK has torn down.
+fn forget_row(rows: &LiveRows, item: &gtk::ListItem) {
+    if let Ok(mut rows) = rows.try_borrow_mut() {
+        rows.retain(|weak| weak.upgrade().is_some_and(|live| live != *item));
+    }
+}
+
+/// The icon of a row built by the name column or a grid cell.
+fn icon_of(item: &gtk::ListItem) -> Option<gtk::Image> {
+    item.child()
+        .and_then(|child| child.downcast::<gtk::Box>().ok())
+        .and_then(|row| row.first_child())
+        .and_then(|first| first.downcast::<gtk::Image>().ok())
+}
+
+/// Tint a folder's symbolic icon — the icon only, never the row or the label.
+///
+/// Every accent class is cleared first: rows are recycled, so the widget that
+/// is about to show an uncoloured file may well have been a mauve folder a
+/// moment ago.
+fn apply_folder_color(item: &gtk::ListItem, colors: &Colors) {
+    let Some(icon) = icon_of(item) else {
+        return;
+    };
+    for accent in Accent::ALL {
+        icon.remove_css_class(accent.css_class());
+    }
+
+    let Some(info) = item.item().and_then(|o| o.downcast::<gio::FileInfo>().ok()) else {
+        return;
+    };
+    if !is_directory(&info) {
+        return;
+    }
+
+    // The common case is an empty store and no work at all.
+    let Ok(store) = colors.try_borrow() else {
+        return;
+    };
+    if store.is_empty() {
+        return;
+    }
+
+    if let Some(accent) = file_of(&info)
+        .and_then(|file| file.path())
+        .and_then(|path| store.get(&path))
+    {
+        icon.add_css_class(accent.css_class());
+    }
+}
+
+/// Let a folder be dragged onto the sidebar to pin it.
+///
+/// Only folders start a drag, and the payload is Hive's own boxed type, so a
+/// drag never reaches another application. Dragging files out is v1.1.
+fn watch_drag(
+    item: &gtk::ListItem,
+    child: &impl IsA<gtk::Widget>,
+    selection: &gtk::MultiSelection,
+) {
+    let source = gtk::DragSource::new();
+    source.set_actions(gtk::gdk::DragAction::COPY);
+
+    let item = item.clone();
+    let selection = selection.clone();
+    let widget = child.as_ref().clone();
+
+    source.connect_prepare(move |source, _, _| {
+        let paths = draggable_folders(&item, &selection);
+        if paths.is_empty() {
+            return None;
+        }
+
+        // A picture of the row itself, so what is under the cursor is the thing
+        // being dragged rather than an anonymous rectangle.
+        let paintable = gtk::WidgetPaintable::new(Some(&widget));
+        source.set_icon(Some(&paintable), 0, 0);
+
+        Some(FolderDrag::new(paths).content())
+    });
+
+    child.as_ref().add_controller(source);
+}
+
+/// What a drag starting on this row should carry.
+///
+/// Dragging a row inside a multi-selection takes the whole selection; dragging
+/// one outside it takes just that row, which is what every other file manager
+/// does and what the eye expects.
+fn draggable_folders(item: &gtk::ListItem, selection: &gtk::MultiSelection) -> Vec<PathBuf> {
+    let position = item.position();
+    if selection.selection().contains(position) {
+        return selected_directories(selection);
+    }
+
+    item.item()
+        .and_then(|object| object.downcast::<gio::FileInfo>().ok())
+        .filter(is_directory)
+        .and_then(|info| file_of(&info))
+        .and_then(|file| file.path())
+        .map(|path| vec![path])
+        .unwrap_or_default()
+}
+
+fn selected_directories(selection: &gtk::MultiSelection) -> Vec<PathBuf> {
+    let selected = selection.selection();
+    let mut paths = Vec::new();
+    for index in 0..selection.n_items() {
+        if !selected.contains(index) {
+            continue;
+        }
+        if let Some(info) = selection
+            .item(index)
+            .and_then(|object| object.downcast::<gio::FileInfo>().ok())
+            .filter(is_directory)
+            && let Some(path) = file_of(&info).and_then(|file| file.path())
+        {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
 /// Let a row announce itself when right-clicked, and select it if it was not.
 fn watch_right_click(
     item: &gtk::ListItem,
@@ -535,6 +710,8 @@ fn watch_right_click(
 fn build_column_view(
     selection: &gtk::MultiSelection,
     right_clicked: &Rc<Cell<Option<u32>>>,
+    colors: &Colors,
+    rows: &LiveRows,
 ) -> gtk::ColumnView {
     let view = gtk::ColumnView::builder()
         .model(selection)
@@ -546,7 +723,7 @@ fn build_column_view(
         .build();
 
     view.set_enable_rubberband(true);
-    view.append_column(&name_column(selection, right_clicked));
+    view.append_column(&name_column(selection, right_clicked, colors, rows));
 
     let size_column = text_column("Size", |info| {
         if is_directory(info) {
@@ -588,11 +765,14 @@ fn build_column_view(
 fn name_column(
     selection: &gtk::MultiSelection,
     right_clicked: &Rc<Cell<Option<u32>>>,
+    colors: &Colors,
+    rows: &LiveRows,
 ) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
 
-    let selection = selection.clone();
+    let for_setup = selection.clone();
     let right_clicked = Rc::clone(right_clicked);
+    let setup_rows = Rc::clone(rows);
     factory.connect_setup(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
@@ -609,10 +789,20 @@ fn name_column(
         row.append(&icon);
         row.append(&label);
         item.set_child(Some(&row));
-        watch_right_click(item, &row, &right_clicked, &selection);
+        watch_right_click(item, &row, &right_clicked, &for_setup);
+        watch_drag(item, &row, &for_setup);
+        register_row(&setup_rows, item);
     });
 
-    factory.connect_bind(|_, item| {
+    let teardown_rows = Rc::clone(rows);
+    factory.connect_teardown(move |_, item| {
+        if let Some(item) = item.downcast_ref::<gtk::ListItem>() {
+            forget_row(&teardown_rows, item);
+        }
+    });
+
+    let bind_colors = Rc::clone(colors);
+    factory.connect_bind(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
         };
@@ -648,6 +838,8 @@ fn name_column(
                 label.remove_css_class("hive-file-symlink");
             }
         }
+
+        apply_folder_color(item, &bind_colors);
     });
 
     gtk::ColumnViewColumn::builder()
@@ -699,11 +891,14 @@ fn text_column(
 fn build_grid_view(
     selection: &gtk::MultiSelection,
     right_clicked: &Rc<Cell<Option<u32>>>,
+    colors: &Colors,
+    rows: &LiveRows,
 ) -> gtk::GridView {
     let factory = gtk::SignalListItemFactory::new();
 
     let for_setup = selection.clone();
     let right_clicked = Rc::clone(right_clicked);
+    let setup_rows = Rc::clone(rows);
     factory.connect_setup(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
@@ -730,9 +925,19 @@ fn build_grid_view(
         cell.append(&label);
         item.set_child(Some(&cell));
         watch_right_click(item, &cell, &right_clicked, &for_setup);
+        watch_drag(item, &cell, &for_setup);
+        register_row(&setup_rows, item);
     });
 
-    factory.connect_bind(|_, item| {
+    let teardown_rows = Rc::clone(rows);
+    factory.connect_teardown(move |_, item| {
+        if let Some(item) = item.downcast_ref::<gtk::ListItem>() {
+            forget_row(&teardown_rows, item);
+        }
+    });
+
+    let bind_colors = Rc::clone(colors);
+    factory.connect_bind(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
         };
@@ -762,6 +967,8 @@ fn build_grid_view(
             label.set_text(&name);
             label.set_tooltip_text(Some(&name));
         }
+
+        apply_folder_color(item, &bind_colors);
     });
 
     gtk::GridView::builder()

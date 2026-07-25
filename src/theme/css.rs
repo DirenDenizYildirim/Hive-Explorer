@@ -303,6 +303,28 @@ popover > arrow {{
   color: {accent};
 }}
 
+/* A pinned folder that is no longer on disk. Dimmed, never removed: the
+   pinned list is the user's, and Hive does not edit it on their behalf. */
+.hive-sidebar row.hive-missing label {{
+  color: {overlay0};
+  font-style: italic;
+}}
+
+.hive-sidebar row.hive-missing image {{
+  color: {overlay0};
+}}
+
+/* Where a dragged folder would land. */
+.hive-sidebar.hive-drop-active {{
+  background-color: {surface0};
+}}
+
+/* The unpin menu on a pinned row. */
+.hive-row-menu button {{
+  min-width: 120px;
+  padding: 4px 10px;
+}}
+
 /* Breadcrumb: flat segments, one accent at a time. */
 .hive-breadcrumb button {{
   color: {subtext0};
@@ -430,8 +452,8 @@ popover > arrow {{
     for slot in Accent::ALL {
         let _ = writeln!(
             css,
-            ".hive-folder-icon.hive-accent-{}{{color:{};}}",
-            slot.id(),
+            ".hive-folder-icon.{}{{color:{};}}",
+            slot.css_class(),
             palette.accent(slot).to_hex()
         );
     }
@@ -457,7 +479,11 @@ popover > arrow {{
   border-color: {overlay1};
 }}
 
-.hive-swatch:checked {{
+/* Checked is the accent picker; focus is the folder-color grid, which is
+   pressed rather than toggled and still has to show where the keyboard is. */
+.hive-swatch:checked,
+.hive-swatch:focus,
+.hive-swatch:focus-visible {{
   border-color: {text};
 }}
 ",
@@ -468,8 +494,8 @@ popover > arrow {{
     for slot in Accent::ALL {
         let _ = writeln!(
             css,
-            ".hive-swatch.hive-accent-{}{{background-color:{};}}",
-            slot.id(),
+            ".hive-swatch.{}{{background-color:{};}}",
+            slot.css_class(),
             palette.accent(slot).to_hex()
         );
     }

@@ -220,6 +220,30 @@ impl Accent {
         }
     }
 
+    /// The CSS class the stylesheet generator emits for this slot.
+    ///
+    /// A constant rather than `format!("hive-accent-{}", id())`: it is applied
+    /// and removed in the file pane's bind callback, which runs for every row
+    /// that scrolls past, and that is no place to allocate fourteen strings.
+    pub const fn css_class(self) -> &'static str {
+        match self {
+            Accent::Rosewater => "hive-accent-rosewater",
+            Accent::Flamingo => "hive-accent-flamingo",
+            Accent::Pink => "hive-accent-pink",
+            Accent::Mauve => "hive-accent-mauve",
+            Accent::Red => "hive-accent-red",
+            Accent::Maroon => "hive-accent-maroon",
+            Accent::Peach => "hive-accent-peach",
+            Accent::Yellow => "hive-accent-yellow",
+            Accent::Green => "hive-accent-green",
+            Accent::Teal => "hive-accent-teal",
+            Accent::Sky => "hive-accent-sky",
+            Accent::Sapphire => "hive-accent-sapphire",
+            Accent::Blue => "hive-accent-blue",
+            Accent::Lavender => "hive-accent-lavender",
+        }
+    }
+
     pub fn from_id(id: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|accent| accent.id() == id)
     }
@@ -358,6 +382,13 @@ mod tests {
             assert_eq!(Accent::from_id(accent.id()), Some(accent));
         }
         assert_eq!(Accent::from_id("chartreuse"), None);
+    }
+
+    #[test]
+    fn css_classes_match_the_generated_stylesheet_names() {
+        for accent in Accent::ALL {
+            assert_eq!(accent.css_class(), format!("hive-accent-{}", accent.id()));
+        }
     }
 
     #[test]

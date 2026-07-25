@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
+use crate::colors;
 use crate::config::{self, Config};
 use crate::paths;
 use crate::theme::{Registry, ThemeProvider};
@@ -18,6 +19,7 @@ pub const REVEAL_HINT: &str = "select";
 struct AppState {
     config: Rc<RefCell<Config>>,
     registry: Rc<RefCell<Registry>>,
+    colors: Rc<RefCell<colors::Store>>,
     theme: ThemeProvider,
     /// Deferred until a window exists to show it in.
     startup_notice: RefCell<Option<String>>,
@@ -101,8 +103,17 @@ fn start_up() -> AppState {
         ));
     }
 
+    let colors_path = paths::folder_colors_file();
+    let folder_colors = colors::load(&colors_path);
+    if let Some(message) = describe_color_notice(folder_colors.notice.as_ref(), &colors_path)
+        && notice.is_none()
+    {
+        notice = Some(message);
+    }
+
     let config = Rc::new(RefCell::new(loaded.config));
     let registry = Rc::new(RefCell::new(registry));
+    let colors = Rc::new(RefCell::new(folder_colors.store));
 
     let theme = match gtk::gdk::Display::default() {
         Some(display) => {
@@ -132,6 +143,7 @@ fn start_up() -> AppState {
     AppState {
         config,
         registry,
+        colors,
         theme,
         startup_notice: RefCell::new(notice),
     }
@@ -157,6 +169,7 @@ fn ensure_window(
         app,
         Rc::clone(&state.config),
         Rc::clone(&state.registry),
+        Rc::clone(&state.colors),
         state.theme.clone(),
     );
 
@@ -216,6 +229,31 @@ fn describe_notice(notice: Option<&config::Notice>, path: &Path) -> Option<Strin
         config::Notice::Migrated { from, to } => {
             tracing::info!(from, to, "config migrated");
             None
+        }
+    }
+}
+
+/// Folder colors are decorative, so a bad file is worth a line in the log and
+/// at most a banner — never a refusal to launch.
+fn describe_color_notice(notice: Option<&colors::Notice>, path: &Path) -> Option<String> {
+    match notice? {
+        colors::Notice::Recovered { backup, reason } => {
+            tracing::warn!(%reason, backup = %backup.display(), "folder colors were malformed");
+            Some(format!(
+                "Your folder colors were unreadable and have been reset. The original is at {}",
+                backup.display()
+            ))
+        }
+        colors::Notice::RecoveryFailed { reason } => {
+            tracing::warn!(%reason, path = %path.display(), "folder colors unusable");
+            Some("Your folder colors could not be read; none are shown".to_owned())
+        }
+        colors::Notice::FromFuture { backup, found } => {
+            tracing::warn!(found, backup = %backup.display(), "folder colors from a newer version");
+            Some(format!(
+                "Your folder colors were written by a newer version of Hive and have been set aside at {}",
+                backup.display()
+            ))
         }
     }
 }
