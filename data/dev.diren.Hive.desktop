@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Hive
+GenericName=File Manager
+Comment=Browse and manage your files
+Keywords=files;folders;browser;explorer;manager;
+Exec=hive %U
+Icon=dev.diren.Hive
+Terminal=false
+Categories=System;FileTools;FileManager;Utility;
+MimeType=inode/directory;
+StartupNotify=true
+StartupWMClass=dev.diren.Hive
+DBusActivatable=true
