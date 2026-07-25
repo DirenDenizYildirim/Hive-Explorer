@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/dev/diren/Hive">
+    <file preprocess="xml-stripblanks">icons/scalable/apps/dev.diren.Hive.svg</file>
+  </gresource>
+</gresources>

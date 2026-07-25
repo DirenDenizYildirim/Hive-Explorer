@@ -1,0 +1,54 @@
+[package]
+name = "hive"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "A Catppuccin file manager for Hyprland"
+license = "MIT"
+repository = "https://github.com/DirenDenizYildirim/Hive-Explorer"
+readme = "README.md"
+
+[lib]
+name = "hive"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hive"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned to the newest gtk4-rs generation that builds on rustc 1.89.0.
+# gtk4 0.11 / glib 0.22 require rustc 1.92. See README "Toolchain" section.
+gtk = { package = "gtk4", version = "0.10.3", features = ["v4_20"] }
+adw = { package = "libadwaita", version = "0.8.1", features = ["v1_9"] }
+glib = "0.21.5"
+gio = "0.21.5"
+
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "0.9.8"
+thiserror = "2.0.19"
+anyhow = "1.0.104"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-appender = "0.2.5"
+
+[build-dependencies]
+glib-build-tools = "0.21.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# A file manager that panics is a file manager that loses your work.
+# Tests opt out with a module-level #![allow(...)]; genuinely-impossible startup
+# invariants opt out per-site with an #[allow] and a justifying comment.
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"

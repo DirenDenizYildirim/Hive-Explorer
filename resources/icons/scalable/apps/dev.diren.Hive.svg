@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>Hive</title>
+  <rect width="128" height="128" rx="28" ry="28" fill="#1e1e2e"/>
+  <path d="M 102 64 L 83 96.9 L 45 96.9 L 26 64 L 45 31.1 L 83 31.1 Z"
+        fill="none" stroke="#cba6f7" stroke-width="9" stroke-linejoin="round"/>
+  <path d="M 76 64 L 70 74.4 L 58 74.4 L 52 64 L 58 53.6 L 70 53.6 Z" fill="#cba6f7"/>
+</svg>
