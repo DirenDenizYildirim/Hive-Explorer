@@ -1,21 +1,4 @@
 //! Resolution of the sidebar's Places section.
-//!
-//! The rule, in order, for each place:
-//!
-//! 1. Ask `glib::user_special_dir()`.
-//! 2. If that returns `None`, fall back to the conventional `~/Name`.
-//! 3. If that path does not exist on disk either, **omit the row entirely.**
-//!
-//! A sidebar entry that points nowhere is a bug, so there is no fourth branch
-//! that renders a dead row, and Hive never offers to create the missing
-//! directory.
-//!
-//! On a system without `xdg-user-dirs` and with only `~/Downloads` present, this
-//! correctly yields Home, Downloads, and Trash.
-//!
-//! The resolution rule is written against injected lookups so it is unit-tested
-//! headlessly, without depending on whatever the test machine happens to have in
-//! its home directory.
 
 use std::path::{Path, PathBuf};
 
@@ -68,8 +51,7 @@ impl PlaceKind {
         }
     }
 
-    /// The conventional directory name under `$HOME`, used as the fallback when
-    /// `user_special_dir()` has nothing to say.
+    /// Conventional directory name under `$HOME`, used when `user_special_dir` is silent.
     pub const fn conventional_name(self) -> Option<&'static str> {
         match self {
             PlaceKind::Home | PlaceKind::Trash => None,
@@ -88,17 +70,10 @@ impl PlaceKind {
 }
 
 /// How Trash can be reached on this system.
-///
-/// `trash://` is **not** part of GIO core — it is a gvfs backend. Without gvfs
-/// installed, `gio info trash:///` answers "Operation not supported", so a Trash
-/// row pointing at that URI is a dead row: it opens, fails to enumerate, and
-/// shows an error banner every time.
-///
-/// Trashing files still works without gvfs, because `g_file_trash()` implements
-/// the freedesktop spec directly. So the trashed files are there on disk — only
-/// the URI scheme for browsing them is missing. Hive therefore falls back to
-/// browsing `$XDG_DATA_HOME/Trash/files` as an ordinary directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// `trash://` is a gvfs backend, not GIO core. Without gvfs it answers
+// "Operation not supported", so a Trash row pointing there is a dead row.
+// Trashing itself still works: g_file_trash implements the spec directly.
 pub enum TrashAccess {
     /// gvfs is present and `trash://` can be enumerated.
     Uri,
@@ -109,10 +84,6 @@ pub enum TrashAccess {
 }
 
 /// Decide how to reach Trash.
-///
-/// `data_home` is `$XDG_DATA_HOME`; `uri_supported` is what GIO's VFS reports
-/// for the `trash` scheme. Split out from the gio call so the decision is
-/// unit-tested.
 pub fn detect_trash_access(
     data_home: &Path,
     uri_supported: bool,
@@ -150,8 +121,6 @@ impl Place {
     /// The URI to navigate to.
     pub fn uri(&self) -> String {
         match (&self.path, self.kind) {
-            // A Trash place with a path is the no-gvfs fallback: an ordinary
-            // directory, addressed as one.
             (Some(path), _) => format!("file://{}", path.display()),
             (None, PlaceKind::Trash) => "trash:///".to_owned(),
             (None, _) => String::new(),
@@ -160,11 +129,6 @@ impl Place {
 }
 
 /// Resolve the Places list.
-///
-/// * `home` — the user's home directory.
-/// * `special` — `glib::user_special_dir()`, or a stand-in in tests.
-/// * `exists` — an existence predicate, so tests do not depend on the real
-///   filesystem.
 pub fn resolve(
     home: &Path,
     special: impl Fn(PlaceKind) -> Option<PathBuf>,
@@ -175,9 +139,6 @@ pub fn resolve(
 
     for kind in PlaceKind::ALL {
         match kind {
-            // Home is the one place that is always offered: it is where Hive
-            // falls back to when anything else goes wrong, so a session with no
-            // Home row would have no safe harbor.
             PlaceKind::Home => places.push(Place {
                 kind,
                 path: Some(home.to_path_buf()),
@@ -189,8 +150,6 @@ pub fn resolve(
                     kind,
                     path: Some(path.clone()),
                 }),
-                // Same rule as every other place: never render a row that
-                // points nowhere.
                 TrashAccess::Unavailable => {}
             },
 
@@ -198,7 +157,6 @@ pub fn resolve(
                 let resolved =
                     special(kind).or_else(|| kind.conventional_name().map(|name| home.join(name)));
 
-                // Omit rather than render a row that points nowhere.
                 if let Some(path) = resolved
                     && exists(&path)
                 {
@@ -226,9 +184,6 @@ mod tests {
 
     #[test]
     fn this_machine_yields_home_downloads_trash() {
-        // The documented state of the target machine: no xdg-user-dirs, so
-        // user_special_dir() answers None for everything, and only ~/Downloads
-        // exists on disk.
         let home = Path::new("/home/diren");
         let present: HashSet<PathBuf> = [home.join("Downloads")].into_iter().collect();
 
@@ -245,7 +200,6 @@ mod tests {
         let home = Path::new("/home/diren");
         let places = resolve(home, |_| None, |_| false, &TrashAccess::Uri);
 
-        // Only Home (always offered) and Trash (virtual) survive.
         assert_eq!(kinds(&places), vec![PlaceKind::Home, PlaceKind::Trash]);
         for place in &places {
             if let Some(path) = &place.path {
@@ -276,7 +230,6 @@ mod tests {
 
     #[test]
     fn special_dir_pointing_at_a_missing_path_is_still_omitted() {
-        // xdg-user-dirs can name a directory the user has since deleted.
         let home = Path::new("/home/diren");
         let places = resolve(
             home,
@@ -349,9 +302,6 @@ mod tests {
 
     #[test]
     fn trash_falls_back_to_the_spec_directory_without_gvfs() {
-        // This is the target machine: no gvfs, so `trash://` is unsupported,
-        // but ~/.local/share/Trash/files exists because g_file_trash() writes
-        // there directly. Browsing the directory is the only way to see it.
         let data_home = Path::new("/home/diren/.local/share");
         let files = data_home.join("Trash").join("files");
         let present: HashSet<PathBuf> = [files.clone()].into_iter().collect();
@@ -370,9 +320,6 @@ mod tests {
 
     #[test]
     fn trash_row_is_omitted_when_it_is_reachable_by_neither_route() {
-        // No gvfs and nothing has ever been trashed: the directory does not
-        // exist. A row here would open, fail to enumerate, and show an error
-        // banner every single time — the same dead-row bug as a missing Place.
         let data_home = Path::new("/home/diren/.local/share");
         let access = detect_trash_access(data_home, false, |_| false);
         assert_eq!(access, TrashAccess::Unavailable);

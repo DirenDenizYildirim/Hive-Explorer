@@ -1,16 +1,4 @@
 //! Theme lookup: built-in flavors plus user-supplied themes.
-//!
-//! v1 ships only the four Catppuccin flavors. This module exists so that adding
-//! a theme is a matter of dropping a file in a directory rather than editing and
-//! recompiling Hive — the switcher lists whatever the registry holds, and the
-//! stylesheet generator treats every entry identically.
-//!
-//! # `std::fs` carve-out
-//!
-//! Like `config` and `colors`, this module uses `std::fs` rather than `gio`. The
-//! reason is the same: it must stay GTK/gio-free so the loader is unit-testable
-//! without a display or a main context. It is read-only directory scanning of
-//! Hive's own config area, never user-facing filesystem work.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -19,8 +7,7 @@ use std::path::{Path, PathBuf};
 use super::catppuccin::{BUILT_IN, MOCHA};
 use super::palette::Palette;
 
-/// A theme file that could not be loaded. Surfaced as a banner, never fatal —
-/// one bad theme file must not stop Hive from starting.
+/// A theme file that could not be loaded. Surfaced as a banner, never fatal.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ThemeLoadError {
     #[error("could not read theme file {path}: {message}")]
@@ -58,21 +45,11 @@ impl Registry {
     }
 
     /// Built-ins plus any `*.toml` themes found in `user_dir`.
-    ///
-    /// A missing directory is not an error — it is the normal case, since Hive
-    /// ships no user themes. Unreadable or malformed files are collected into
-    /// [`Registry::errors`] and skipped.
-    ///
-    /// A user theme whose `id` matches a built-in **replaces** it, keeping the
-    /// built-in's position in the list. That is deliberate: it lets someone
-    /// adjust one flavor without losing the others or having a near-duplicate
-    /// entry in the switcher.
     pub fn load(user_dir: &Path) -> Self {
         let mut registry = Self::built_in();
 
         let entries = match std::fs::read_dir(user_dir) {
             Ok(entries) => entries,
-            // Missing directory is the expected default state.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return registry,
             Err(error) => {
                 registry.errors.push(ThemeLoadError::Read {
@@ -83,7 +60,6 @@ impl Registry {
             }
         };
 
-        // Sort for deterministic ordering — read_dir order is filesystem-defined.
         let mut files: Vec<PathBuf> = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
@@ -123,9 +99,7 @@ impl Registry {
         self.palettes.iter().find(|p| p.id == id)
     }
 
-    /// Resolve `id`, falling back to Mocha when it names a theme that is not
-    /// present — a config referencing a theme file that has since been deleted
-    /// must not prevent startup.
+    /// Resolve `id`, falling back to the default when the theme is gone.
     pub fn get_or_default(&self, id: &str) -> &Palette {
         self.get(id).unwrap_or_else(|| self.default_palette())
     }
@@ -137,14 +111,12 @@ impl Registry {
             .unwrap_or(&MOCHA)
     }
 
-    /// First dark theme, used by follow-system mode when the configured dark
-    /// flavor is missing.
+    /// First dark theme, for follow-system mode when the configured one is missing.
     pub fn first_dark(&self) -> Option<&Palette> {
         self.palettes.iter().find(|p| p.dark)
     }
 
-    /// First light theme, used by follow-system mode when the configured light
-    /// flavor is missing.
+    /// First light theme, for follow-system mode when the configured one is missing.
     pub fn first_light(&self) -> Option<&Palette> {
         self.palettes.iter().find(|p| !p.dark)
     }
@@ -181,8 +153,7 @@ fn load_theme_file(path: &Path) -> Result<Palette, ThemeLoadError> {
     Ok(palette)
 }
 
-/// Serialize a palette to the user-theme TOML format. Used by the tests to keep
-/// the documented format and the parser in lockstep.
+/// Serialize a palette to the documented user-theme TOML format.
 pub fn to_toml(palette: &Palette) -> Result<String, toml::ser::Error> {
     toml::to_string_pretty(palette)
 }
@@ -214,8 +185,6 @@ mod tests {
 
     #[test]
     fn a_built_in_roundtrips_through_the_user_theme_format() {
-        // The documented file format must be exactly what the built-ins are, or
-        // the README example would not actually load.
         let dir = tempfile::tempdir().unwrap();
         let text = to_toml(&MOCHA).unwrap();
         std::fs::write(
@@ -245,7 +214,6 @@ mod tests {
         let mocha = registry.get("mocha").unwrap();
         assert_eq!(mocha.name, "My Mocha");
         assert_eq!(mocha.neutrals.base.to_hex(), "#000000");
-        // Position preserved.
         assert_eq!(registry.all()[3].id, "mocha");
     }
 

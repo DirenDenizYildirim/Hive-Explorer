@@ -1,9 +1,4 @@
 //! The sidebar: Pinned, Places, Recents, Devices.
-//!
-//! Sections that have nothing to show are hidden entirely rather than rendered
-//! empty. On the target machine that means no Pinned section until something is
-//! pinned, and no Devices section at all — see [`crate::fs::volumes`] for why
-//! "no volume backend" cannot be detected by asking whether a backend exists.
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -43,8 +38,6 @@ impl Section {
 
         let list = gtk::ListBox::new();
         list.set_selection_mode(gtk::SelectionMode::Single);
-        // libadwaita's navigation-sidebar styling gives the rows their spacing
-        // and the flat, borderless look.
         list.add_css_class("navigation-sidebar");
 
         container.append(&label);
@@ -92,9 +85,6 @@ impl Sidebar {
         sidebar.rebuild_places();
         sidebar.rebuild_recents();
         sidebar.rebuild_devices();
-        // Pinning arrives in a later milestone, so this section has no rows yet.
-        // Sync it anyway: a section that renders its label above nothing is the
-        // same "empty section" bug the Devices rule exists to avoid.
         sidebar.pinned.sync_visibility();
         sidebar.watch_volumes();
         sidebar.watch_recents();
@@ -103,11 +93,9 @@ impl Sidebar {
     }
 
     pub fn widget(&self) -> gtk::ScrolledWindow {
-        // No width_request here. AdwOverlaySplitView already governs the sidebar
-        // width through its min/max properties; a hard request on top of that
-        // becomes an unshrinkable floor that the split view adds to the content's
-        // minimum, pushing the whole window's minimum past what a tiled layout
-        // may be willing to give it.
+        // No width_request: AdwOverlaySplitView governs sidebar width, and a hard
+        // request on top becomes an unshrinkable floor added to the content's
+        // minimum, pushing the window's minimum past what a tiled layout allows.
         gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vscrollbar_policy(gtk::PolicyType::Automatic)
@@ -125,8 +113,6 @@ impl Sidebar {
             handler(file);
         }
     }
-
-    // ---- Places ---------------------------------------------------------
 
     fn rebuild_places(self: &Rc<Self>) {
         self.places.clear();
@@ -154,8 +140,6 @@ impl Sidebar {
             None => gio::File::for_uri(&place.uri()),
         };
 
-        // Rows are activated on a single click, which is what a sidebar should
-        // do; the file pane keeps double-click activation.
         let sidebar = Rc::clone(self);
         let gesture = gtk::GestureClick::new();
         gesture.connect_released(move |gesture, _, _, _| {
@@ -166,8 +150,6 @@ impl Sidebar {
 
         row
     }
-
-    // ---- Recents --------------------------------------------------------
 
     fn rebuild_recents(self: &Rc<Self>) {
         self.recents.clear();
@@ -182,7 +164,6 @@ impl Sidebar {
             let Some(uri) = Some(item.uri()) else {
                 continue;
             };
-            // Only local files — a remote URI would need gvfs to resolve.
             if !uri.starts_with("file://") {
                 continue;
             }
@@ -190,8 +171,6 @@ impl Sidebar {
             let Some(path) = file.path() else {
                 continue;
             };
-            // Recents accumulate entries for files that no longer exist; a row
-            // that leads nowhere is the same bug as a dead Place.
             if !path.exists() {
                 continue;
             }
@@ -206,7 +185,6 @@ impl Sidebar {
             let row = row_widget("document-open-recent-symbolic", &name);
             row.set_tooltip_text(Some(&path.to_string_lossy()));
 
-            // Recents are files; reveal them by opening the containing folder.
             let parent = file.parent().unwrap_or_else(|| file.clone());
             let sidebar = Rc::clone(self);
             let gesture = gtk::GestureClick::new();
@@ -230,16 +208,12 @@ impl Sidebar {
         });
     }
 
-    // ---- Devices --------------------------------------------------------
-
     fn rebuild_devices(self: &Rc<Self>) {
         self.devices.clear();
 
         let monitor = gio::VolumeMonitor::get();
         let mounts = monitor.mounts();
 
-        // Collect the facts first so the relevance rule — which is plain, tested
-        // Rust — decides, rather than scattering the policy through this loop.
         let mut rows: Vec<(gio::Mount, String)> = Vec::new();
         for mount in mounts {
             let root = mount.root();
@@ -247,9 +221,6 @@ impl Sidebar {
 
             let candidate = MountCandidate {
                 mount_point: path.as_deref(),
-                // Deliberately not queried: filesystem::type needs I/O, and
-                // nothing that touches disk may run on the main context. The
-                // path and removability rules are sufficient here.
                 filesystem: None,
                 is_removable: mount
                     .volume()
@@ -347,8 +318,6 @@ impl Sidebar {
     fn watch_volumes(self: &Rc<Self>) {
         let monitor = gio::VolumeMonitor::get();
 
-        // A drive appearing or vanishing must be reflected without a restart,
-        // and must never leave a row pointing at a mount that is gone.
         let sidebar = Rc::clone(self);
         monitor.connect_mount_added(move |_, _| sidebar.rebuild_devices());
 
@@ -365,8 +334,7 @@ impl Sidebar {
         monitor.connect_volume_removed(move |_, _| sidebar.rebuild_devices());
     }
 
-    /// Clear the selection highlight in every section except the one that was
-    /// just navigated to.
+    /// Highlight the row matching `location`, clearing every other section.
     pub fn sync_selection(&self, location: Option<&gio::File>) {
         for section in [&self.pinned, &self.places, &self.recents, &self.devices] {
             section.list.unselect_all();
@@ -379,7 +347,6 @@ impl Sidebar {
             return;
         };
 
-        // Highlight the Place whose path matches exactly.
         let home = crate::paths::home_dir();
         let resolved = places::resolve(&home, glib_special_dir, |p| p.is_dir(), &trash_access());
         for (index, place) in resolved.iter().enumerate() {
@@ -394,16 +361,6 @@ impl Sidebar {
 }
 
 /// Ask glib for an XDG user directory.
-///
-/// Without `xdg-user-dirs` installed and no `~/.config/user-dirs.dirs`, this
-/// returns `None` for everything except Home, which is exactly the case
-/// [`places::resolve`] is built to handle.
-/// Ask GIO whether it can enumerate `trash://`, and fall back to the on-disk
-/// trash directory when it cannot.
-///
-/// `trash://` is a gvfs backend, not part of GIO core, so on a system without
-/// gvfs this reports unsupported and Hive browses `$XDG_DATA_HOME/Trash/files`
-/// as an ordinary directory instead.
 fn trash_access() -> places::TrashAccess {
     let supported = gio::Vfs::default()
         .supported_uri_schemes()

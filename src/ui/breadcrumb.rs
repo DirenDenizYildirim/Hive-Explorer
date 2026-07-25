@@ -1,7 +1,4 @@
 //! Clickable path breadcrumb for the header bar.
-//!
-//! Paths under `$HOME` are shown as `Home / … ` rather than `/home/diren/…`,
-//! which is both shorter and how the sidebar refers to the same location.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -12,9 +9,6 @@ use adw::prelude::*;
 type NavigateHandler = Rc<dyn Fn(gio::File)>;
 
 /// Segments rendered inline before the trail starts collapsing.
-///
-/// Beyond this, the middle is folded into a single overflow button whose menu
-/// still reaches every hidden ancestor — nothing becomes unnavigable.
 const MAX_INLINE_SEGMENTS: usize = 5;
 
 /// How many trailing segments always stay visible when the trail collapses.
@@ -23,8 +17,7 @@ const TAIL_SEGMENTS: usize = 3;
 /// Characters shown per ancestor segment before it ellipsizes.
 const ANCESTOR_WIDTH_CHARS: i32 = 10;
 
-/// The current directory gets more room than its ancestors — it is the one
-/// segment the user most needs to read.
+/// The current directory gets more room than its ancestors.
 const CURRENT_WIDTH_CHARS: i32 = 24;
 
 pub struct Breadcrumb {
@@ -53,9 +46,6 @@ impl Breadcrumb {
     }
 
     /// Rebuild the trail for `location`.
-    ///
-    /// Non-`file://` locations (Trash, for instance) get a single label, since
-    /// they have no meaningful ancestry to walk.
     pub fn set_location(self: &Rc<Self>, location: &gio::File) {
         self.clear();
 
@@ -71,8 +61,6 @@ impl Breadcrumb {
         let plan = collapse(&segments, MAX_INLINE_SEGMENTS, TAIL_SEGMENTS);
         let last = segments.len().saturating_sub(1);
 
-        // The root segment is itself labelled "/", so a separator straight after
-        // it renders as "/ /".
         let root_is_slash = segments.first().is_some_and(|s| s.label == "/");
 
         for (position, step) in plan.into_iter().enumerate() {
@@ -93,16 +81,13 @@ impl Breadcrumb {
                         button.add_css_class("hive-breadcrumb-current");
                     }
 
-                    // Ellipsizing is what lets the trail shrink. A plain label
-                    // reports its full text as its minimum width, so the header
-                    // bar — and through it AdwOverlaySplitView — would demand
-                    // more room than a tiled window may be given, and the
-                    // under-allocation cascades into negative scrollbar sizes
-                    // elsewhere in the tree. An ellipsized label's minimum is
-                    // small, so the window stays free to shrink.
                     if let Some(label) =
                         button.child().and_then(|c| c.downcast::<gtk::Label>().ok())
                     {
+                        // Ellipsizing is what lets the trail shrink: a plain
+                        // label reports its full text as its minimum width,
+                        // which propagates up and makes the split view demand
+                        // more room than a tiled window may be given.
                         label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
                         label.set_max_width_chars(if is_current {
                             CURRENT_WIDTH_CHARS
@@ -195,19 +180,11 @@ pub enum Step {
 }
 
 /// Decide which segments render inline and which fold into the overflow button.
-///
-/// A deep path must not push the window wider than the compositor is willing to
-/// make it — under a tiling WM the window cannot ask for a size at all. Rather
-/// than scroll the trail (which costs a scrollbar and its sizing quirks), the
-/// middle collapses into one button whose menu still reaches every ancestor.
-///
-/// The first segment always stays, so the root or Home is always one click away.
 pub fn collapse(segments: &[Segment], max_inline: usize, tail: usize) -> Vec<Step> {
     if segments.len() <= max_inline {
         return (0..segments.len()).map(Step::Segment).collect();
     }
 
-    // Keep the first, fold the middle, keep the last `tail`.
     let tail_start = segments.len() - tail;
     let mut steps = Vec::with_capacity(tail + 2);
     steps.push(Step::Segment(0));
@@ -265,7 +242,6 @@ mod tests {
         let labels: Vec<&str> = segments.iter().map(|s| s.label.as_str()).collect();
         assert_eq!(labels, ["Home", "Downloads", "photos"]);
 
-        // Every segment must navigate to a real path, not a display fragment.
         assert_eq!(segments[0].path, PathBuf::from("/home/diren"));
         assert_eq!(segments[1].path, PathBuf::from("/home/diren/Downloads"));
         assert_eq!(
@@ -303,8 +279,6 @@ mod tests {
 
     #[test]
     fn a_sibling_of_home_does_not_collapse() {
-        // "/home/di" shares a string prefix with "/home/diren" but is not under
-        // it; collapsing it to "Home" would mislabel the location.
         let home = Path::new("/home/diren");
         let segments = segments_for(Path::new("/home/di/work"), home);
         let labels: Vec<&str> = segments.iter().map(|s| s.label.as_str()).collect();
@@ -368,9 +342,6 @@ mod tests {
 
     #[test]
     fn no_segment_becomes_unreachable_when_collapsed() {
-        // Every index must appear exactly once, inline or inside the overflow
-        // range — a collapsed ancestor that is not in the menu is a path the
-        // user can no longer click back to.
         let segments: Vec<Segment> = (0..40).map(|i| seg(&format!("level{i}"))).collect();
         let plan = collapse(&segments, 5, 3);
 

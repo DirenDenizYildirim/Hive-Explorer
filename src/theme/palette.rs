@@ -1,20 +1,4 @@
 //! Theme data types.
-//!
-//! This module is deliberately free of GTK and gio so it can be unit-tested
-//! without a display or a main context.
-//!
-//! # The 14-slot accent contract
-//!
-//! [`Accent`] is a fixed set of fourteen named slots. It is *not* Catppuccin
-//! data — it is the contract every theme fills in. Folder colors (see the
-//! `colors` module) are persisted by accent *name*, so a folder tagged "mauve"
-//! resolves through whichever palette is currently active. That is what lets a
-//! folder color survive a flavor switch, and it is also what will let it
-//! survive a switch to a user-supplied theme that has nothing to do with
-//! Catppuccin: such a theme simply maps its own colors onto these same slots.
-//!
-//! If accents were free-form strings, every stored folder color would break the
-//! moment a theme that did not happen to define that name became active.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -23,9 +7,6 @@ use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize, Serializer};
 
 /// An 8-bit-per-channel opaque color.
-///
-/// Serialized as a CSS-style `#rrggbb` string so hand-written theme files stay
-/// readable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Color {
     pub r: u8,
@@ -38,8 +19,7 @@ impl Color {
         Self { r, g, b }
     }
 
-    /// Build from a `0xRRGGBB` literal. Used by the built-in palettes so the
-    /// constant tables read like the upstream Catppuccin definitions.
+    /// Build from a `0xRRGGBB` literal.
     pub const fn rgb(value: u32) -> Self {
         Self {
             r: ((value >> 16) & 0xff) as u8,
@@ -111,8 +91,7 @@ impl Color {
     }
 }
 
-/// WCAG contrast ratio between two colors, from 1.0 (identical) to 21.0
-/// (black on white). Order-independent.
+/// WCAG contrast ratio, 1.0 (identical) to 21.0 (black on white).
 pub fn contrast_ratio(a: Color, b: Color) -> f32 {
     let (lighter, darker) = {
         let (la, lb) = (a.relative_luminance(), b.relative_luminance());
@@ -158,11 +137,14 @@ impl<'de> Deserialize<'de> for Color {
 }
 
 /// The fourteen accent slots every theme must fill.
-///
-/// Order matches the upstream Catppuccin ordering, which is also the order the
-/// swatch grid renders in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+/// The fourteen accent slots every theme fills.
+///
+/// A fixed contract, not palette-specific data. Folder colors persist by slot
+/// name, so a folder tagged "mauve" resolves through whichever theme is active —
+/// including a user theme that maps its own colors onto these slots. Free-form
+/// accent names would break every stored folder color on a theme switch.
 pub enum Accent {
     Rosewater,
     Flamingo,
@@ -198,8 +180,7 @@ impl Accent {
         Accent::Lavender,
     ];
 
-    /// Stable serialization key. This string is what ends up in the folder-color
-    /// store, so it must never change.
+    /// Stable serialization key. Persisted in the folder-color store; never change it.
     pub const fn id(self) -> &'static str {
         match self {
             Accent::Rosewater => "rosewater",
@@ -302,17 +283,13 @@ pub struct Neutrals {
 }
 
 /// A complete theme: identity, polarity, fourteen accents, twelve neutrals.
-///
-/// `Cow<'static, str>` lets the built-in flavors be genuine `const` values while
-/// user-supplied themes deserialize into owned strings through the same type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Palette {
     /// Stable identifier, e.g. `"mocha"`. Persisted in the config file.
     pub id: Cow<'static, str>,
     /// Human-readable name shown in the flavor switcher, e.g. `"Mocha"`.
     pub name: Cow<'static, str>,
-    /// Whether this is a dark theme. Drives `AdwStyleManager` color scheme and
-    /// the direction of elevation shading.
+    /// Whether this is a dark theme. Drives the color scheme and shading direction.
     pub dark: bool,
     pub accents: Accents,
     pub neutrals: Neutrals,
@@ -324,13 +301,6 @@ impl Palette {
     }
 
     /// A foreground legible on top of `background`.
-    ///
-    /// Picks whichever end of the neutral ramp contrasts more, rather than
-    /// branching on the theme's polarity. Polarity is not enough: in Latte both
-    /// `crust` and `base` are light, so a polarity-based choice puts pale text
-    /// on Latte's yellow accent. `crust` and `text` are the ramp's extremes and
-    /// always straddle the midpoint in opposite directions, in every flavor and
-    /// in any user theme that fills the slots sensibly.
     pub fn on_color(&self, background: Color) -> Color {
         let candidates = [self.neutrals.crust, self.neutrals.text];
         candidates
@@ -338,7 +308,6 @@ impl Palette {
             .max_by(|a, b| {
                 contrast_ratio(*a, background).total_cmp(&contrast_ratio(*b, background))
             })
-            // `candidates` is a non-empty array literal, so this is unreachable.
             .unwrap_or(self.neutrals.text)
     }
 }
@@ -393,8 +362,6 @@ mod tests {
 
     #[test]
     fn accents_get_covers_every_slot() {
-        // Every slot must return the value stored in its own field; a copy-paste
-        // slip in `get` would silently mis-tint folder colors.
         let accents = Accents {
             rosewater: Color::rgb(0x000001),
             flamingo: Color::rgb(0x000002),
@@ -455,7 +422,6 @@ mod tests {
         assert_eq!(a.mix(b, 0.0), a);
         assert_eq!(a.mix(b, 1.0), b);
         assert_eq!(a.mix(b, 0.5), Color::new(128, 128, 128));
-        // Out-of-range factors clamp rather than wrapping or panicking.
         assert_eq!(a.mix(b, -3.0), a);
         assert_eq!(a.mix(b, 9.0), b);
     }

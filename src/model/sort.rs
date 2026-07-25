@@ -1,9 +1,4 @@
 //! Sort comparators.
-//!
-//! Plain Rust with no GTK types, so `cargo test` exercises the ordering rules
-//! without a display. The `gtk::CustomSorter` shim in `ui::file_pane` does
-//! nothing but read fields off a `gio::FileInfo` into [`SortKeyData`] and call
-//! [`compare`].
 
 use std::cmp::Ordering;
 
@@ -117,10 +112,6 @@ impl<'a> SortKeyData<'a> {
 }
 
 /// Order two entries under `spec`.
-///
-/// The folders-first grouping is applied *outside* the ascending/descending
-/// flip: reversing the sort must not sink directories below files, which is
-/// what users mean by "folders first".
 pub fn compare(a: &SortKeyData<'_>, b: &SortKeyData<'_>, spec: SortSpec) -> Ordering {
     if spec.folders_first && a.is_dir != b.is_dir {
         return if a.is_dir {
@@ -133,10 +124,6 @@ pub fn compare(a: &SortKeyData<'_>, b: &SortKeyData<'_>, spec: SortSpec) -> Orde
     let primary = match spec.key {
         SortKey::Name => Ordering::Equal,
         SortKey::Size => {
-            // Sizing directories against files is meaningless — a directory's
-            // own inode size says nothing about its contents, and computing the
-            // real answer is an unbounded tree walk we refuse to do implicitly.
-            // Group directories together and fall through to name.
             if a.is_dir && b.is_dir {
                 Ordering::Equal
             } else {
@@ -157,7 +144,6 @@ pub fn compare(a: &SortKeyData<'_>, b: &SortKeyData<'_>, spec: SortSpec) -> Orde
         return primary;
     }
 
-    // Name is the tie-break for every key, and the only key for SortKey::Name.
     let by_name = natural_cmp(a.name, b.name);
     if spec.order.is_descending() {
         by_name.reverse()
@@ -166,12 +152,7 @@ pub fn compare(a: &SortKeyData<'_>, b: &SortKeyData<'_>, spec: SortSpec) -> Orde
     }
 }
 
-/// Human-friendly comparison: case-insensitive, with digit runs compared as
-/// numbers so `file2` sorts before `file10`.
-///
-/// Ties broken by the raw bytes so the ordering is total and therefore stable —
-/// a comparator that returns `Equal` for distinct names makes the sorted view
-/// reshuffle on unrelated updates.
+/// Case-insensitive, with digit runs compared numerically so `file2` < `file10`.
 pub fn natural_cmp(a: &str, b: &str) -> Ordering {
     let mut left = a.chars().peekable();
     let mut right = b.chars().peekable();
@@ -186,8 +167,6 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
                     let (l_digits, l_zeros) = take_number(&mut left);
                     let (r_digits, r_zeros) = take_number(&mut right);
 
-                    // Compare by length first, then lexically: this compares
-                    // arbitrarily long runs numerically without overflowing.
                     let by_number = l_digits
                         .len()
                         .cmp(&r_digits.len())
@@ -195,8 +174,6 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
                     if by_number != Ordering::Equal {
                         return by_number;
                     }
-                    // Equal numerically: fewer leading zeros first, so `01`
-                    // and `1` still order deterministically.
                     let by_zeros = l_zeros.cmp(&r_zeros);
                     if by_zeros != Ordering::Equal {
                         return by_zeros;
@@ -213,13 +190,10 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
         }
     }
 
-    // Case-folded equal: fall back to the raw form so `Foo` and `foo` have a
-    // stable, total order rather than comparing equal.
     a.cmp(b)
 }
 
-/// Consume a digit run, returning its significant digits and how many leading
-/// zeros preceded them.
+/// Consume a digit run: significant digits, plus the leading-zero count.
 fn take_number(iter: &mut std::iter::Peekable<std::str::Chars<'_>>) -> (String, usize) {
     let mut zeros = 0usize;
     while iter.peek().is_some_and(|c| *c == '0') {
@@ -240,8 +214,7 @@ fn take_number(iter: &mut std::iter::Peekable<std::str::Chars<'_>>) -> (String, 
     (digits, zeros)
 }
 
-/// Lowercase for comparison. Uses simple case folding, which is correct for the
-/// filename cases that matter and avoids allocating per character.
+/// Lowercase for comparison, using simple case folding.
 fn fold(c: char) -> char {
     c.to_lowercase().next().unwrap_or(c)
 }
@@ -274,8 +247,6 @@ mod tests {
 
     #[test]
     fn very_long_digit_runs_do_not_overflow() {
-        // A 40-digit number would overflow u64/u128 parsing; length-then-lexical
-        // comparison handles it.
         let a = format!("f{}1", "9".repeat(40));
         let b = format!("f{}2", "9".repeat(40));
         assert_eq!(natural_cmp(&a, &b), Ordering::Less);
@@ -289,7 +260,6 @@ mod tests {
     fn name_order_is_case_insensitive_but_total() {
         assert_eq!(natural_cmp("apple", "Banana"), Ordering::Less);
         assert_eq!(natural_cmp("Apple", "banana"), Ordering::Less);
-        // Same folded form must still be a strict order, never Equal.
         assert_ne!(natural_cmp("Foo", "foo"), Ordering::Equal);
         assert_eq!(natural_cmp("foo", "foo"), Ordering::Equal);
     }
@@ -334,7 +304,6 @@ mod tests {
             ["alpha", "zed", "a.txt", "b.txt"]
         );
 
-        // Reversing must reverse within each group, not sink folders below files.
         let desc = SortSpec::new(SortKey::Name, SortOrder::Descending, true);
         assert_eq!(
             sorted(items.clone(), desc),
@@ -362,8 +331,6 @@ mod tests {
 
     #[test]
     fn directories_never_compare_by_their_own_size() {
-        // Two directories differ only in reported inode size; they must order by
-        // name, not by that meaningless number.
         let mut a = dir("zebra");
         a.size = 4096;
         let mut b = dir("alpha");
@@ -413,7 +380,6 @@ mod tests {
 
     #[test]
     fn names_with_newlines_and_odd_bytes_still_order() {
-        // Invalid UTF-8 arrives lossily converted; the comparator must not care.
         let weird = ["a\nb", "a b", "a\tb", "a\u{fffd}b", ""];
         let items: Vec<SortKeyData<'_>> = weird.iter().map(|n| file(n)).collect();
         let spec = SortSpec::new(SortKey::Name, SortOrder::Ascending, false);

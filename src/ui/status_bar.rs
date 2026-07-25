@@ -1,7 +1,4 @@
 //! The thin status line: item count, selection count, free space.
-//!
-//! Updates are debounced on a 150 ms window (see [`crate::ui::debounce`]) so a
-//! directory under heavy churn cannot thrash the view.
 
 use adw::prelude::*;
 
@@ -54,13 +51,8 @@ impl StatusBar {
     }
 
     /// Refresh the counts.
-    ///
-    /// `visible` is the post-filter count and `total` the raw directory count;
-    /// when a filter is hiding entries we say so, because "3 items" in a
-    /// directory of 400 is otherwise alarming.
     pub fn set_counts(&self, visible: u32, total: u32, selected: u32, loading: bool) {
         let text = if loading {
-            // While enumerating, the count is a running total, not a final one.
             format!("{}…", format::item_count(visible as usize))
         } else if visible == total {
             format::item_count(visible as usize)
@@ -101,8 +93,6 @@ impl StatusBar {
                     label.set_text(&text);
                 }
                 Err(error) => {
-                    // Trash, or a backend that does not report free space. Not
-                    // worth a banner — just say nothing.
                     tracing::debug!(%error, "free space unavailable");
                     label.set_visible(false);
                     label.set_text("");

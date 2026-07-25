@@ -1,9 +1,4 @@
 //! Application bootstrap.
-//!
-//! The `adw::Application` is constructed with
-//! [`gio::ApplicationFlags::HANDLES_OPEN`] from the start, so a second `hive`
-//! invocation activates the running instance rather than spawning a second
-//! process, and so the navigation milestone does not have to restructure this.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -50,8 +45,6 @@ pub fn build() -> adw::Application {
                 return;
             };
             let window = ensure_window(app, &state, &window);
-            // A bare `hive`, or a second launch with no path: show home unless
-            // the window is already somewhere.
             if window.location().is_none() {
                 window.navigate_home();
             }
@@ -80,13 +73,8 @@ pub fn build() -> adw::Application {
 }
 
 /// Load config and themes, and install the stylesheet provider.
-///
-/// Runs on `startup`, which is after GTK has a display but before any window
-/// exists, so the very first frame is already themed — no flash of unstyled UI.
 fn start_up() -> AppState {
     adw::init().unwrap_or_else(|error| {
-        // libadwaita initialization only fails if GTK itself failed, in which
-        // case we are already doomed; log rather than panic.
         tracing::error!(%error, "libadwaita failed to initialize");
     });
 
@@ -116,7 +104,6 @@ fn start_up() -> AppState {
             let provider = ThemeProvider::install(&display);
             provider.connect_diagnostics();
 
-            // Paint the configured flavor before the first window maps.
             let borrowed = config.borrow();
             let palette = registry.get_or_default(&borrowed.appearance.flavor);
             let options = crate::theme::StyleOptions {
@@ -130,7 +117,6 @@ fn start_up() -> AppState {
             provider
         }
         None => {
-            // No display: nothing will render anyway, but do not crash here.
             tracing::error!("no display available; continuing unstyled");
             ThemeProvider::detached()
         }
@@ -145,9 +131,6 @@ fn start_up() -> AppState {
 }
 
 /// Register the icon bundle compiled in by `build.rs`.
-///
-/// Failure is not fatal: the stock icon theme covers everything Hive uses
-/// today, and the bundle only supplies the application icon.
 fn register_resources() {
     if let Err(error) = gio::resources_register_include!("hive.gresource") {
         tracing::warn!(%error, "bundled icons unavailable; falling back to the icon theme");
@@ -179,9 +162,6 @@ fn ensure_window(
 }
 
 /// Navigate to a path from the command line.
-///
-/// A file target opens its parent directory; preselecting the file itself lands
-/// with the selection work in the navigation milestone.
 fn navigate_to_target(window: &Rc<Window>, file: &gio::File) {
     let Some(path) = file.path() else {
         window.navigate_to(file);
@@ -233,9 +213,8 @@ fn describe_notice(notice: Option<&config::Notice>, path: &Path) -> Option<Strin
 /// Resolve a command-line path in *this* process.
 ///
 /// `hive .` must resolve against the invoking shell's working directory. If the
-/// running instance did the resolving, `.` would mean whatever directory that
-/// process happened to start in, and the feature would silently open the wrong
-/// folder.
+/// already-running instance resolved it, `.` would mean whatever directory that
+/// process started in, and the feature would silently open the wrong folder.
 pub fn canonicalize_local(input: &Path) -> PathBuf {
     let home = paths::home_dir();
     let expanded = crate::model::path::expand_tilde(input, &home);
@@ -247,7 +226,5 @@ pub fn canonicalize_local(input: &Path) -> PathBuf {
 
     let resolved = crate::model::path::resolve_against(&cwd, &expanded);
 
-    // Prefer the real path when it exists, so symlinked directories report a
-    // stable identity; fall back to the lexical form when it does not.
     crate::model::path::canonicalize_existing(&resolved).unwrap_or(resolved)
 }

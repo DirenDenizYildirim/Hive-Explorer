@@ -1,20 +1,9 @@
 //! Path normalization and containment checks.
-//!
-//! Plain Rust, no GTK. The lexical functions here never touch the filesystem, so
-//! they behave identically in tests and on a path that has since vanished.
 
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
 /// Resolve `.` and `..` lexically, without consulting the filesystem.
-///
-/// This is deliberately *not* `std::fs::canonicalize`: it does not resolve
-/// symlinks and does not require the path to exist. Use it to tidy a
-/// user-supplied path for display and comparison; use
-/// [`canonicalize_existing`] when symlink identity actually matters.
-///
-/// Leading `..` components on a relative path are preserved, since there is no
-/// filesystem context in which to resolve them.
 pub fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     let mut pending_parents = 0usize;
@@ -25,7 +14,6 @@ pub fn normalize(path: &Path) -> PathBuf {
             Component::RootDir => out.push(Component::RootDir.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
-                // Popping past the root is a no-op: `/..` is `/`.
                 let popped = match out.components().next_back() {
                     Some(Component::Normal(_)) => out.pop(),
                     _ => false,
@@ -55,11 +43,6 @@ pub fn normalize(path: &Path) -> PathBuf {
 }
 
 /// Resolve `input` against `base` when relative, then normalize.
-///
-/// This is what `hive .` depends on: the working directory must be the
-/// *invoking shell's*, captured before the path is handed to an already-running
-/// instance. Resolving it in the running process would silently open whatever
-/// directory that process happened to start in.
 pub fn resolve_against(base: &Path, input: &Path) -> PathBuf {
     if input.is_absolute() {
         normalize(input)
@@ -68,9 +51,7 @@ pub fn resolve_against(base: &Path, input: &Path) -> PathBuf {
     }
 }
 
-/// Expand a leading `~` or `~/…` against `home`. Other users' `~name` forms are
-/// left alone — resolving them needs passwd lookups and is not worth the
-/// surface area.
+/// Expand a leading `~` against `home`. Other users' `~name` is left alone.
 pub fn expand_tilde(input: &Path, home: &Path) -> PathBuf {
     let Some(text) = input.to_str() else {
         return input.to_path_buf();
@@ -87,23 +68,16 @@ pub fn expand_tilde(input: &Path, home: &Path) -> PathBuf {
 
 /// True when `ancestor` is `descendant` or contains it.
 ///
-/// Compares whole path components, so `/home/di` is **not** treated as an
-/// ancestor of `/home/diren` — a prefix-string check would get that wrong and,
-/// in the copy pre-flight, would refuse legitimate operations while a subtly
-/// different bug let real recursive copies through.
+/// Compares whole components, so `/home/di` is not an ancestor of `/home/diren`.
+/// A string-prefix check would refuse legitimate copies and, worse, its inverse
+/// bug would let real recursive copies through.
 pub fn is_ancestor(ancestor: &Path, descendant: &Path) -> bool {
     let ancestor = normalize(ancestor);
     let descendant = normalize(descendant);
     descendant.starts_with(&ancestor)
 }
 
-/// True when copying or moving `source` into `destination` would place a
-/// directory inside its own subtree, or onto itself.
-///
-/// This is the classic recursive data-eater, so the check is intentionally
-/// conservative: it is purely lexical and does not need either path to exist.
-/// The pre-flight in `fs::preflight` runs this against canonicalized paths as
-/// well, to catch the symlinked-into-itself case that lexical comparison misses.
+/// True when copying or moving `source` into `destination` would recurse.
 pub fn would_recurse(source: &Path, destination: &Path) -> bool {
     let source = normalize(source);
     let destination = normalize(destination);
@@ -111,10 +85,6 @@ pub fn would_recurse(source: &Path, destination: &Path) -> bool {
 }
 
 /// The final component, as a lossy string suitable for display.
-///
-/// Filenames are bytes on Linux and need not be valid UTF-8. Invalid sequences
-/// become U+FFFD rather than being rejected, so such a file is still visible and
-/// selectable instead of vanishing from the listing.
 pub fn display_name(path: &Path) -> String {
     path.file_name()
         .map(OsStr::to_string_lossy)
@@ -129,9 +99,6 @@ pub fn parent_of(path: &Path) -> Option<PathBuf> {
 }
 
 /// Every ancestor from the root down to `path`, for the breadcrumb bar.
-///
-/// The result always starts at the root for an absolute path, and each entry is
-/// a real navigable path rather than a display fragment.
 pub fn breadcrumb_segments(path: &Path) -> Vec<PathBuf> {
     let normalized = normalize(path);
     let mut segments: Vec<PathBuf> = normalized
@@ -144,18 +111,11 @@ pub fn breadcrumb_segments(path: &Path) -> Vec<PathBuf> {
 }
 
 /// Resolve symlinks and `..` for real. Requires the path to exist.
-///
-/// Only used where symlink identity genuinely matters — the copy/move
-/// pre-flight, and undo re-validation.
 pub fn canonicalize_existing(path: &Path) -> std::io::Result<PathBuf> {
     std::fs::canonicalize(path)
 }
 
 /// Split a filename into stem and extension for conflict-resolution renaming.
-///
-/// Dotfiles are treated as having no extension: `.bashrc` is a stem, not an
-/// extension, so a conflicting copy becomes `.bashrc (copy)` rather than
-/// `. (copy)bashrc`.
 pub fn split_extension(name: &str) -> (&str, Option<&str>) {
     let trimmed = name.strip_prefix('.').unwrap_or(name);
     let leading_dot = name.len() - trimmed.len();
@@ -211,8 +171,6 @@ mod tests {
 
     #[test]
     fn relative_paths_resolve_against_the_invoking_directory() {
-        // This is the `hive .` case: resolving against the caller's cwd, not the
-        // running instance's.
         let cwd = Path::new("/home/diren/projects/hive");
         assert_eq!(
             resolve_against(cwd, Path::new(".")),
@@ -243,7 +201,6 @@ mod tests {
             expand_tilde(Path::new("~/Downloads"), home),
             PathBuf::from("/home/diren/Downloads")
         );
-        // Another user's home needs a passwd lookup; leave it untouched.
         assert_eq!(
             expand_tilde(Path::new("~root/x"), home),
             PathBuf::from("~root/x")
@@ -261,8 +218,6 @@ mod tests {
             Path::new("/home/diren"),
             Path::new("/home/diren")
         ));
-        // The bug this guards against: "/home/di" is a string prefix of
-        // "/home/diren" but is not an ancestor of it.
         assert!(!is_ancestor(
             Path::new("/home/di"),
             Path::new("/home/diren")
@@ -273,12 +228,10 @@ mod tests {
 
     #[test]
     fn recursion_check_catches_self_and_subtree() {
-        // Copying a directory onto itself.
         assert!(would_recurse(
             Path::new("/home/diren/data"),
             Path::new("/home/diren/data")
         ));
-        // Copying a directory into its own child — the data-eater.
         assert!(would_recurse(
             Path::new("/home/diren/data"),
             Path::new("/home/diren/data/backup")
@@ -287,7 +240,6 @@ mod tests {
             Path::new("/home/diren/data"),
             Path::new("/home/diren/data/a/b/c")
         ));
-        // Unrelated destinations are fine.
         assert!(!would_recurse(
             Path::new("/home/diren/data"),
             Path::new("/home/diren/other")
@@ -296,7 +248,6 @@ mod tests {
             Path::new("/home/diren/data"),
             Path::new("/home/diren")
         ));
-        // Sibling with a shared string prefix must not be refused.
         assert!(!would_recurse(
             Path::new("/home/diren/data"),
             Path::new("/home/diren/data2")
@@ -371,7 +322,6 @@ mod tests {
             ("archive.tar", Some("gz"))
         );
         assert_eq!(split_extension("README"), ("README", None));
-        // A dotfile has no extension.
         assert_eq!(split_extension(".bashrc"), (".bashrc", None));
         assert_eq!(split_extension(".config.toml"), (".config", Some("toml")));
         assert_eq!(split_extension("trailing."), ("trailing", Some("")));

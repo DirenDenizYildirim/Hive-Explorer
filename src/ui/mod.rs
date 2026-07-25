@@ -1,5 +1,4 @@
-//! Widgets. Everything in here touches GTK; the rules they enforce live in
-//! `crate::model`, `crate::config`, and `crate::theme`.
+//! Widgets. This layer touches GTK and holds no policy of its own.
 
 pub mod breadcrumb;
 pub mod debounce;

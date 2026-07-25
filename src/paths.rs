@@ -1,13 +1,8 @@
 //! XDG location resolution.
-//!
-//! Kept out of `config`, `colors`, and `theme::registry` on purpose: those
-//! modules take a `&Path` so they stay testable without glib. This is the one
-//! place that decides where those paths actually are.
 
 use std::path::PathBuf;
 
-/// Application identifier. Also the Wayland `app_id`, so Hyprland
-/// `windowrulev2` rules can target Hive.
+/// Application identifier, and therefore the Wayland `app_id` window rules target.
 pub const APP_ID: &str = "dev.diren.Hive";
 
 /// Subdirectory name used under each XDG root.
@@ -23,8 +18,7 @@ pub fn config_file() -> PathBuf {
     config_dir().join("config.toml")
 }
 
-/// `$XDG_CONFIG_HOME/hive/themes/` — user-supplied themes. Ships empty; drop a
-/// `.toml` in and it appears in the flavor switcher.
+/// `$XDG_CONFIG_HOME/hive/themes/` — user themes. Ships empty.
 pub fn themes_dir() -> PathBuf {
     config_dir().join("themes")
 }
@@ -40,10 +34,6 @@ pub fn thumbnail_cache_dir() -> PathBuf {
 }
 
 /// `$XDG_STATE_HOME/hive/logs/`
-///
-/// glib gained `g_get_user_state_dir` in 2.72 and the system runs 2.88, but the
-/// fallback chain is kept so a missing binding or an unset environment cannot
-/// stop logging from initializing.
 pub fn log_dir() -> PathBuf {
     state_dir().join(DIR_NAME).join("logs")
 }
@@ -70,8 +60,6 @@ mod tests {
 
     #[test]
     fn app_id_is_the_documented_string() {
-        // Hyprland window rules key off this exact value; changing it silently
-        // breaks every rule the user has written.
         assert_eq!(APP_ID, "dev.diren.Hive");
     }
 

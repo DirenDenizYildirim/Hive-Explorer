@@ -1,21 +1,4 @@
 //! The file pane: one model stack, two views.
-//!
-//! ```text
-//! gtk::DirectoryList        async, incremental, monitored
-//!   └─ gtk::FilterListModel   hidden-file toggle, Ctrl+F substring filter
-//!        └─ gtk::SortListModel  name / size / modified / type, folders-first
-//!             └─ gtk::MultiSelection
-//!                  └─ gtk::ColumnView | gtk::GridView
-//! ```
-//!
-//! `DirectoryList` already does progressive loading, cancellation on
-//! navigate-away, and directory monitoring, all upstream-tested. Hive adds no
-//! enumeration logic of its own — the decision rules live in `crate::model` as
-//! plain functions, and the `CustomFilter`/`CustomSorter` here are thin shims
-//! that read a `gio::FileInfo` into those functions' input types.
-//!
-//! Both views bind to the *same* selection model, so toggling between them is a
-//! stack page switch and never re-enumerates the directory.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -29,10 +12,6 @@ use crate::model::filter::{self, FilterInput, FilterSpec};
 use crate::model::sort::{self, SortKeyData, SortSpec};
 
 /// Attributes requested from every entry.
-///
-/// Kept to what the view actually renders and sorts by. Asking for more makes
-/// enumeration slower on large directories; `standard::file` is supplied by
-/// `DirectoryList` itself and does not need requesting.
 const ATTRIBUTES: &str = concat!(
     "standard::name,",
     "standard::display-name,",
@@ -75,8 +54,6 @@ impl FilePane {
         }));
 
         let directory_list = gtk::DirectoryList::new(Some(ATTRIBUTES), gio::File::NONE);
-        // Enumerate below the frame clock so a huge directory cannot starve
-        // redraws: the list stays interactive while it fills.
         directory_list.set_io_priority(glib::Priority::DEFAULT_IDLE);
         directory_list.set_monitored(true);
 
@@ -95,7 +72,6 @@ impl FilePane {
 
         let filter_model =
             gtk::FilterListModel::new(Some(directory_list.clone()), Some(custom_filter.clone()));
-        // Filter in chunks so a 100k-entry directory does not block the frame.
         filter_model.set_incremental(true);
 
         let custom_sorter = gtk::CustomSorter::new(clone!(
@@ -197,10 +173,6 @@ impl FilePane {
     }
 
     /// Point the pane at a new location.
-    ///
-    /// `DirectoryList` cancels any in-flight enumeration for the previous
-    /// directory, so navigating away from a slow or unresponsive mount returns
-    /// immediately rather than waiting for it to finish.
     pub fn set_location(&self, file: &gio::File) {
         self.directory_list.set_file(Some(file));
     }
@@ -213,8 +185,7 @@ impl FilePane {
         self.directory_list.is_loading()
     }
 
-    /// Switch between list and grid. Purely a stack page change: the models are
-    /// untouched, so nothing re-enumerates and the selection is preserved.
+    /// Switch between list and grid. A stack page change only; nothing re-enumerates.
     pub fn set_view_mode(&self, mode: ViewMode) {
         self.container.set_visible_child_name(mode.id());
     }
@@ -227,8 +198,6 @@ impl FilePane {
             }
             state.filter.show_hidden = show_hidden;
         }
-        // Showing more or fewer entries is not a refinement in either
-        // direction, so the filter has to be re-evaluated from scratch.
         self.custom_filter.changed(gtk::FilterChange::Different);
     }
 
@@ -238,8 +207,6 @@ impl FilePane {
             if state.filter.query == query {
                 return;
             }
-            // Typing another character can only remove matches; telling GTK that
-            // lets it skip re-testing entries already filtered out.
             let change = if query.starts_with(state.filter.query.as_str()) {
                 gtk::FilterChange::MoreStrict
             } else if state.filter.query.starts_with(query) {
@@ -338,8 +305,7 @@ impl FilePane {
         self.directory_list.connect_loading_notify(move |_| h());
     }
 
-    /// Notify when enumeration reports an error — permission denied, a vanished
-    /// directory, an unmounted device.
+    /// Notify when enumeration fails: permission denied, vanished, unmounted.
     pub fn connect_error(&self, handler: impl Fn(glib::Error) + 'static) {
         self.directory_list.connect_error_notify(move |list| {
             if let Some(error) = list.error() {
@@ -376,8 +342,6 @@ fn scrolled(child: &impl IsA<gtk::Widget>) -> gtk::ScrolledWindow {
         .build()
 }
 
-// ---- Column view --------------------------------------------------------
-
 fn build_column_view(selection: &gtk::MultiSelection) -> gtk::ColumnView {
     let view = gtk::ColumnView::builder()
         .model(selection)
@@ -391,8 +355,6 @@ fn build_column_view(selection: &gtk::MultiSelection) -> gtk::ColumnView {
     view.append_column(&name_column());
     view.append_column(&text_column("Size", |info| {
         if is_directory(info) {
-            // A directory's own size is meaningless, and computing the real
-            // answer is an unbounded tree walk we refuse to do implicitly.
             String::new()
         } else {
             crate::model::format::human_bytes(info.size().max(0) as u64)
@@ -469,8 +431,6 @@ fn name_column() -> gtk::ColumnViewColumn {
         if let Some(label) = child.and_then(|c| c.downcast::<gtk::Label>().ok()) {
             let name = display_name(&info);
             label.set_text(&name);
-            // A newline in a filename would otherwise make the row grow; keep
-            // it single-line and show the real name in the tooltip.
             label.set_single_line_mode(true);
             label.set_tooltip_text(Some(&name));
             if info.is_symlink() {
@@ -526,8 +486,6 @@ fn text_column(
         .resizable(true)
         .build()
 }
-
-// ---- Grid view ----------------------------------------------------------
 
 fn build_grid_view(selection: &gtk::MultiSelection) -> gtk::GridView {
     let factory = gtk::SignalListItemFactory::new();
@@ -601,13 +559,7 @@ fn build_grid_view(selection: &gtk::MultiSelection) -> gtk::GridView {
         .build()
 }
 
-// ---- FileInfo accessors -------------------------------------------------
-
 /// The name to show, falling back through display-name, name, then the URI.
-///
-/// Filenames on Linux are bytes and need not be valid UTF-8. gio's
-/// `display-name` is already lossily converted, which is what we want: the file
-/// stays visible and selectable rather than disappearing from the listing.
 fn display_name(info: &gio::FileInfo) -> String {
     let display = info.display_name();
     if !display.is_empty() {
@@ -641,8 +593,7 @@ fn file_of(info: &gio::FileInfo) -> Option<gio::File> {
         .and_then(|object| object.downcast::<gio::File>().ok())
 }
 
-/// Used only when gio has no symbolic icon at all — a broken symlink, or an
-/// entry whose content type could not be determined.
+/// Used only when gio reports no symbolic icon at all.
 fn fallback_icon(info: &gio::FileInfo) -> &'static str {
     if is_directory(info) {
         "folder-symbolic"

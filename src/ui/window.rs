@@ -89,18 +89,12 @@ impl Window {
             .application(app)
             .title("Hive")
             .content(&split)
-            // A tiling compositor resizes us to whatever it likes. These are the
-            // floors below which the layout stops being usable, and they are
-            // under the 500x400 the spec requires us to survive.
             .width_request(360)
             .height_request(300)
             .default_width(1100)
             .default_height(700)
             .build();
 
-        // Collapse the sidebar to an overlay on a narrow window. Driven by an
-        // adw::Breakpoint so the compositor can resize us to any geometry and
-        // the layout follows without us requesting a size.
         let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
             adw::BreakpointConditionLengthType::MaxWidth,
             f64::from(defaults::SIDEBAR_BREAKPOINT_PX),
@@ -140,8 +134,6 @@ impl Window {
     pub fn present(&self) {
         self.window.present();
     }
-
-    // ---- Header ---------------------------------------------------------
 
     fn build_header(self: &Rc<Self>, header: &adw::HeaderBar) {
         let toggle_sidebar = gtk::ToggleButton::new();
@@ -185,8 +177,6 @@ impl Window {
         header.pack_end(&view_toggle);
     }
 
-    // ---- Navigation -----------------------------------------------------
-
     fn wire_navigation(self: &Rc<Self>) {
         let this = Rc::clone(self);
         self.sidebar.connect_navigate(move |file| {
@@ -198,8 +188,6 @@ impl Window {
             this.navigate_to(&file);
         });
 
-        // Row activation: enter directories. Opening files lands with the rest
-        // of the navigation work in the next milestone.
         let this = Rc::clone(self);
         self.file_pane.connect_activate(move |file, is_dir| {
             if is_dir {
@@ -249,11 +237,7 @@ impl Window {
         self.file_pane.location()
     }
 
-    /// Enumeration failed: permission denied, the directory vanished, or the
-    /// device was unmounted while we were browsing it.
-    ///
-    /// Never fatal, never a modal. A location that no longer exists falls back
-    /// to Home so the window is never left sitting on a dead path.
+    /// Enumeration failed. Never fatal, never a modal.
     fn handle_enumeration_error(self: &Rc<Self>, error: &glib::Error) {
         tracing::warn!(%error, "directory enumeration failed");
 
@@ -273,7 +257,6 @@ impl Window {
                 "{where_it_was} is no longer available — showing Home"
             ));
             self.navigate_home();
-            // navigate_to clears the banner, so re-raise it afterwards.
             self.show_banner(&format!(
                 "{where_it_was} is no longer available — showing Home"
             ));
@@ -297,8 +280,6 @@ impl Window {
         self.toasts.add_toast(adw::Toast::new(message));
     }
 
-    // ---- Status line ----------------------------------------------------
-
     fn wire_status(self: &Rc<Self>) {
         let this = Rc::clone(self);
         let debouncer = Debouncer::new(defaults::DEBOUNCE_MS, move || {
@@ -312,13 +293,9 @@ impl Window {
 
         *self.status_debouncer.borrow_mut() = Some(debouncer.clone());
 
-        // A directory loading progressively fires items-changed continuously;
-        // the 150 ms window turns that into a readable counter instead of a blur.
         self.file_pane
             .connect_items_changed(move || debouncer.trigger());
     }
-
-    // ---- Actions --------------------------------------------------------
 
     fn install_actions(self: &Rc<Self>, app: &adw::Application) {
         let toggle_hidden = gio::SimpleAction::new_stateful(
@@ -365,13 +342,11 @@ impl Window {
             .application_icon(crate::paths::APP_ID)
             .developer_name("Diren Deniz Yildirim")
             .version(env!("CARGO_PKG_VERSION"))
-            .comments("A Catppuccin file manager for Hyprland.")
+            .comments("Minimal pastel explorer.")
             .license_type(gtk::License::MitX11)
             .build();
         about.present(Some(&self.window));
     }
-
-    // ---- View state -----------------------------------------------------
 
     pub fn set_view_mode(self: &Rc<Self>, mode: ViewMode) {
         self.file_pane.set_view_mode(mode);
@@ -414,7 +389,6 @@ impl Window {
 }
 
 fn view_icon(mode: ViewMode) -> &'static str {
-    // The button shows the mode it will switch *to*.
     match mode {
         ViewMode::List => "view-grid-symbolic",
         ViewMode::Grid => "view-list-symbolic",

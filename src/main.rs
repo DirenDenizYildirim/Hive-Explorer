@@ -1,7 +1,4 @@
-//! Hive — a Catppuccin file manager for Hyprland.
-//!
-//! A thin entry point: parse the command line, resolve any path against *this*
-//! process's working directory, then hand off to [`hive::app`].
+//! Hive — minimal pastel explorer.
 
 use std::ffi::OsString;
 
@@ -33,11 +30,8 @@ fn main() -> glib::ExitCode {
         return glib::ExitCode::SUCCESS;
     }
 
-    // Hold the guard for the whole process: dropping it stops the log writer.
     let _log_guard = logging::init(&paths::log_dir(), args.verbose);
 
-    // Resolve the target here, in the invoking process, before anything is
-    // dispatched to an already-running instance. See app::canonicalize_local.
     let target = args.target.as_deref().map(|input| {
         let resolved = app::canonicalize_local(input);
         tracing::debug!(
@@ -51,10 +45,6 @@ fn main() -> glib::ExitCode {
 
     let application = app::build();
 
-    // Register before dispatching so `open`/`activate` reach the running
-    // instance over D-Bus when there is one. Going through GApplication's own
-    // argv parsing instead would force paths through `&str`, which would mangle
-    // filenames that are not valid UTF-8.
     if let Err(error) = application.register(gio::Cancellable::NONE) {
         eprintln!("hive: could not register application: {error}");
         return glib::ExitCode::FAILURE;
@@ -69,8 +59,6 @@ fn main() -> glib::ExitCode {
     }
 
     if application.is_remote() {
-        // A window already exists in the primary instance and has been told
-        // where to go. Nothing further to do in this process.
         tracing::debug!("handed off to the running instance");
         return glib::ExitCode::SUCCESS;
     }

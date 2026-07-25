@@ -1,12 +1,4 @@
 //! The four built-in Catppuccin flavors, as compile-time constants.
-//!
-//! These are the only themes Hive ships. They are plain [`Palette`] values with
-//! no privileged status — the stylesheet generator cannot tell them apart from a
-//! user-supplied theme, which is what keeps the theming system genuinely
-//! extensible rather than Catppuccin-shaped.
-//!
-//! Values are the upstream Catppuccin palette
-//! (<https://github.com/catppuccin/catppuccin>).
 
 use std::borrow::Cow;
 
@@ -186,7 +178,6 @@ mod tests {
 
     #[test]
     fn every_flavor_defines_every_accent_distinctly() {
-        // Guards against a copy-paste slip leaving two slots with the same value.
         for palette in BUILT_IN {
             let mut seen: Vec<String> = Accent::ALL
                 .into_iter()
@@ -206,10 +197,6 @@ mod tests {
 
     #[test]
     fn elevation_steps_below_base_get_progressively_deeper() {
-        // crust -> mantle -> base is the "below the content surface" run, and it
-        // brightens in *both* polarities: in Latte, crust is a shade darker than
-        // base rather than lighter. The header bar and sidebar sit on mantle, so
-        // an inversion here would make them read as raised instead of recessed.
         for palette in BUILT_IN {
             let n = &palette.neutrals;
             let steps = [n.crust, n.mantle, n.base];
@@ -225,11 +212,6 @@ mod tests {
 
     #[test]
     fn the_content_ramp_runs_monotonically_from_base_to_text() {
-        // base -> surface -> overlay -> subtext -> text moves away from the
-        // background toward the foreground. In a dark flavor that means getting
-        // lighter; in Latte, darker. Either way it must be monotonic, or
-        // elevation shading inverts partway and surfaces stop reading as
-        // layered.
         for palette in BUILT_IN {
             let n = &palette.neutrals;
             let ramp = [
@@ -249,10 +231,6 @@ mod tests {
 
     #[test]
     fn every_accent_gets_a_readable_foreground() {
-        // Selection fills and suggested buttons draw text on an accent. The
-        // chosen foreground must be the better of the ramp's two extremes for
-        // all 14 accents in all 4 flavors — this is the assertion that fails if
-        // on_color goes back to branching on theme polarity.
         use crate::theme::palette::contrast_ratio;
 
         for palette in BUILT_IN {

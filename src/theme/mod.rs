@@ -1,7 +1,4 @@
-//! Theming: palette data, the four built-in Catppuccin flavors, the runtime
-//! stylesheet generator, and the single CssProvider that applies it.
-//!
-//! Everything except [`provider`] is GTK-free and unit-tested headlessly.
+//! Theming: palette data, built-in flavors, stylesheet generation.
 
 pub mod catppuccin;
 pub mod css;

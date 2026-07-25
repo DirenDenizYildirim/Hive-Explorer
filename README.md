@@ -1,6 +1,6 @@
 # Hive
 
-A Catppuccin file manager for Hyprland, written in Rust with GTK 4 and libadwaita.
+Minimal pastel explorer — a file manager for Hyprland, written in Rust with GTK 4 and libadwaita.
 
 Priority order: **stability > visual polish > feature count.** A small set of operations that never fail is
 worth more than a wide feature set that occasionally corrupts or hangs.

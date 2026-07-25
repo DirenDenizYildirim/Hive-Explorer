@@ -1,8 +1,4 @@
 //! Coalescing timer for view-derived UI.
-//!
-//! Status-line counts and selection totals are recomputed from the model, and a
-//! directory under active churn can emit hundreds of change notifications a
-//! second. Debouncing turns that into one update per window.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -40,9 +36,6 @@ impl Debouncer {
     }
 
     /// Run immediately, cancelling any pending trailing run.
-    ///
-    /// Used when the user does something deliberate — navigating, toggling a
-    /// filter — where waiting out the window would feel laggy.
     pub fn flush(&self) {
         self.pending.set(false);
         (self.action)();

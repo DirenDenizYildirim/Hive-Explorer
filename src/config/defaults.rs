@@ -1,7 +1,4 @@
 //! First-launch defaults, in one place.
-//!
-//! The flavor is explicit rather than derived from the system appearance
-//! portal, so first run never depends on a portal reply that may not come.
 
 use crate::theme::palette::Accent;
 
@@ -26,8 +23,7 @@ pub const THUMBNAIL_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
 /// Disable thumbnailing in directories with more entries than this.
 pub const THUMBNAIL_MAX_DIRECTORY_ENTRIES: usize = 2000;
 
-/// Coalescing window for view-derived UI (status counts, selection totals) and
-/// for directory-monitor churn.
+/// Coalescing window for view-derived UI and directory-monitor churn.
 pub const DEBOUNCE_MS: u32 = 150;
 
 /// Sidebar collapses to an overlay below this window width.

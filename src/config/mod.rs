@@ -1,18 +1,4 @@
 //! Persistent configuration.
-//!
-//! # Design constraints
-//!
-//! * **No GTK, no gio.** This module is unit-tested without a display or a main
-//!   context, so it takes a `&Path` rather than resolving `$XDG_CONFIG_HOME`
-//!   itself. The caller in `app` does that resolution.
-//! * **`std::fs` carve-out.** Per the build spec, config uses `std::fs` for its
-//!   atomic temp-file-plus-`rename` write instead of `gio`. This is one of the
-//!   two sanctioned exceptions (the other is the folder-color store, plus the
-//!   read-only theme registry scan) and exists precisely so this module can stay
-//!   gio-free and testable.
-//! * **Never refuse to launch.** Every failure mode here degrades to defaults
-//!   plus a user-visible notice. There is no path where a bad config file stops
-//!   Hive from starting.
 
 pub mod defaults;
 
@@ -23,8 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::model::sort::{SortKey, SortOrder};
 use crate::theme::palette::Accent;
 
-/// Current schema version. Bump when a field changes meaning, and add a
-/// migration arm in [`migrate`].
+/// Current schema version. Bump it and add a `migrate` arm when a field changes meaning.
 pub const CURRENT_VERSION: u32 = 1;
 
 /// How the file pane presents entries.
@@ -64,15 +49,12 @@ impl ViewMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Appearance {
-    /// Theme id. Resolved through `theme::Registry`, which falls back to Mocha
-    /// if this names a theme that no longer exists. An explicit default means
-    /// first launch never waits on a portal reply.
+    /// Theme id, resolved through `theme::Registry`, which falls back to Mocha.
     pub flavor: String,
     /// UI accent: selection, focus rings, active sidebar row.
     #[serde(deserialize_with = "lenient_accent")]
     pub accent: Accent,
-    /// Best-effort light/dark following via the appearance portal. Off by
-    /// default; an explicit flavor always wins and always works.
+    /// Best-effort light/dark following via the appearance portal.
     pub follow_system: bool,
     pub light_flavor: String,
     pub dark_flavor: String,
@@ -152,8 +134,7 @@ impl Default for Thumbnails {
 pub struct Behavior {
     /// Default is to copy the symlink itself, not its target.
     pub follow_symlinks_on_copy: bool,
-    /// Warn on quit while Hive owns a file clipboard — Wayland clipboard
-    /// contents die with the owning process.
+    /// Warn on quit while Hive owns a file clipboard; it dies with the process.
     pub warn_clipboard_on_quit: bool,
     /// Off by default: `hjkl` navigation with `gg`/`G`.
     pub vim_keys: bool,
@@ -203,25 +184,19 @@ impl Default for Config {
 }
 
 /// Why the loaded config is not simply the file on disk.
-///
-/// Surfaced as an inline banner, never a modal, and never fatal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Notice {
-    /// The file was unreadable or malformed. It was backed up and defaults were
-    /// regenerated.
+    /// Unreadable or malformed: backed up, defaults regenerated.
     Recovered { backup: PathBuf, reason: String },
-    /// The file could not even be backed up; defaults are in use for this
-    /// session and the original is untouched.
+    /// Could not even be backed up; defaults in use, original untouched.
     RecoveryFailed { reason: String },
-    /// The file was written by a newer Hive. Backed up, defaults regenerated,
-    /// rather than silently discarding fields we do not understand.
+    /// Written by a newer Hive: backed up rather than losing fields we cannot round-trip.
     FromFuture { backup: PathBuf, found: u32 },
     /// Migrated forward from an older schema version.
     Migrated { from: u32, to: u32 },
 }
 
-/// The result of loading: always a usable config, plus anything worth telling
-/// the user.
+/// Always a usable config, plus anything worth telling the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Loaded {
     pub config: Config,
@@ -256,10 +231,6 @@ pub enum SaveError {
 }
 
 /// Load the config at `path`.
-///
-/// A missing file yields defaults with no notice — that is first launch, not an
-/// error. Anything unreadable or malformed is backed up to `<name>.bak` and
-/// replaced by defaults, with a [`Notice`] for the banner.
 pub fn load(path: &Path) -> Loaded {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -267,8 +238,6 @@ pub fn load(path: &Path) -> Loaded {
             return Loaded::clean(Config::default());
         }
         Err(error) => {
-            // Unreadable but present: do not clobber it, since the cause may be
-            // a transient permission problem and the file may be valuable.
             return Loaded {
                 config: Config::default(),
                 notice: Some(Notice::RecoveryFailed {
@@ -286,8 +255,6 @@ pub fn load(path: &Path) -> Loaded {
     };
 
     if parsed.version > CURRENT_VERSION {
-        // Written by a newer Hive. Rewriting it would silently drop fields we
-        // cannot round-trip, so preserve it and start clean.
         let found = parsed.version;
         return match back_up(path, &text) {
             Ok(backup) => Loaded {
@@ -345,21 +312,13 @@ pub fn backup_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Bring an older config forward. No-op at v1; the arms land here as the schema
-/// evolves.
+/// Bring an older config forward. No-op at v1.
 fn migrate(mut config: Config) -> Config {
-    // Each future migration is an arm here, applied in order:
-    //   if config.version < 2 { ...; config.version = 2; }
     config.version = CURRENT_VERSION;
     config
 }
 
 /// Write `config` to `path` atomically.
-///
-/// Serializes to a sibling temp file, flushes it, then `rename`s over the
-/// target. `rename` within a directory is atomic on Linux, so a crash or a
-/// full disk mid-write leaves either the old file or the new one — never a
-/// truncated config that would be discarded on next launch.
 pub fn save(path: &Path, config: &Config) -> Result<(), SaveError> {
     use std::io::Write as _;
 
@@ -385,8 +344,6 @@ pub fn save(path: &Path, config: &Config) -> Result<(), SaveError> {
                 path: temp.clone(),
                 source,
             })?;
-        // Flush to disk before the rename, so the rename cannot expose a file
-        // whose contents have not landed yet.
         file.sync_all().map_err(|source| SaveError::Write {
             path: temp.clone(),
             source,
@@ -394,7 +351,6 @@ pub fn save(path: &Path, config: &Config) -> Result<(), SaveError> {
     }
 
     std::fs::rename(&temp, path).map_err(|source| {
-        // Leave no litter behind if the rename fails.
         let _ = std::fs::remove_file(&temp);
         SaveError::Write {
             path: path.to_path_buf(),
@@ -408,13 +364,6 @@ fn temp_path(path: &Path) -> PathBuf {
     name.push(".tmp");
     PathBuf::from(name)
 }
-
-// ---- Lenient enum deserializers -----------------------------------------
-//
-// A typo in one enum-valued key should not invalidate the whole file and reset
-// every other setting. These fall back to the default value and leave a log
-// line, while genuine type errors (a table where a string belongs) still fail
-// the parse and take the backup-and-regenerate path.
 
 fn lenient_accent<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Accent, D::Error> {
     let raw = String::deserialize(deserializer)?;
@@ -477,14 +426,11 @@ mod tests {
         assert_eq!(config.appearance.accent, Accent::Mauve);
         assert_eq!(config.view.mode, ViewMode::List);
         assert!(!config.appearance.follow_system);
-        // Compositor owns rounding and shadow.
         assert!(!config.appearance.client_side_rounding);
         assert!(!config.appearance.client_side_shadow);
-        // Symlinks are copied as links; vim keys off.
         assert!(!config.behavior.follow_symlinks_on_copy);
         assert!(!config.behavior.vim_keys);
         assert!(config.behavior.warn_clipboard_on_quit);
-        // Thumbnail caps.
         assert_eq!(config.thumbnails.max_pixels, 256);
         assert_eq!(config.thumbnails.max_file_bytes, 32 * 1024 * 1024);
         assert_eq!(config.thumbnails.max_directory_entries, 2000);
@@ -563,7 +509,6 @@ mod tests {
             panic!("expected a Recovered notice, got {:?}", loaded.notice);
         };
         assert_eq!(backup, backup_path(&path));
-        // The original content must be preserved verbatim in the backup.
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), garbage);
     }
 
@@ -580,7 +525,6 @@ mod tests {
 
     #[test]
     fn unknown_enum_value_falls_back_without_discarding_the_file() {
-        // A typo in one key must not reset every other setting.
         let dir = tempfile::tempdir().unwrap();
         let path = config_in(dir.path());
         std::fs::write(
@@ -598,7 +542,6 @@ mod tests {
         let loaded = load(&path);
         assert_eq!(loaded.notice, None, "not a recoverable-file situation");
         assert_eq!(loaded.config.appearance.accent, Accent::Mauve, "fell back");
-        // Everything else survived.
         assert_eq!(loaded.config.view.mode, ViewMode::Grid);
         assert!(loaded.config.view.show_hidden);
     }
@@ -647,8 +590,6 @@ mod tests {
 
     #[test]
     fn newer_version_is_preserved_rather_than_rewritten() {
-        // A config from a future Hive may hold fields this build cannot
-        // round-trip. Back it up instead of silently dropping them.
         let dir = tempfile::tempdir().unwrap();
         let path = config_in(dir.path());
         let future = "version = 99\n[appearance]\nflavor = \"latte\"\n";
@@ -665,7 +606,6 @@ mod tests {
 
     #[test]
     fn a_directory_where_the_config_belongs_does_not_panic() {
-        // Pathological but real: something created a directory at config.toml.
         let dir = tempfile::tempdir().unwrap();
         let path = config_in(dir.path());
         std::fs::create_dir(&path).unwrap();
@@ -677,7 +617,6 @@ mod tests {
 
     #[test]
     fn save_reports_an_error_rather_than_panicking_on_a_bad_path() {
-        // /proc is not writable; save must return Err, not unwind.
         let result = save(
             Path::new("/proc/hive-should-not-exist/config.toml"),
             &Config::default(),
@@ -695,7 +634,6 @@ mod tests {
 
     #[test]
     fn serialized_form_is_human_editable() {
-        // The file is meant to be hand-edited; check it looks like it.
         let text = toml::to_string_pretty(&Config::default()).unwrap();
         assert!(text.contains("version = 1"), "{text}");
         assert!(text.contains("[appearance]"), "{text}");

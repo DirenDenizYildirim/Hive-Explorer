@@ -1,19 +1,4 @@
 //! Which mounts belong in the sidebar's Devices section.
-//!
-//! # Why this needs a rule at all
-//!
-//! `gvfs` is not installed on the target machine, but `gio::VolumeMonitor` is
-//! never empty regardless: GIO has a built-in Unix volume monitor that reports
-//! entries straight out of the mount table. So "hide the section when there is
-//! no volume backend" cannot be implemented by asking whether a backend exists —
-//! there always is one, and it will happily list `/`, `/boot`, and a pile of
-//! pseudo-filesystems.
-//!
-//! The rule Hive uses instead: **show the section only if at least one mount is
-//! user-relevant.** Everything else is hidden silently — no empty section, no
-//! error, no nag banner.
-//!
-//! The predicate is plain Rust so it is unit-tested without a VolumeMonitor.
 
 use std::path::Path;
 
@@ -60,16 +45,13 @@ const PSEUDO_FILESYSTEMS: [&str; 14] = [
 
 /// Whether a mount is worth showing in Devices.
 ///
-/// Removable or ejectable media always qualifies — that is the whole point of
-/// the section. Everything else must be a real mount somewhere outside the
-/// system areas.
+/// GIO's built-in Unix volume monitor reports the mount table even without gvfs,
+/// so "is a backend present" is never false and cannot gate the section.
 pub fn is_user_relevant(candidate: &MountCandidate<'_>) -> bool {
     if candidate.is_shadowed {
         return false;
     }
 
-    // Removable media is the primary case and short-circuits the path rules: a
-    // USB stick mounted under /run/media is still a USB stick.
     if candidate.is_removable || candidate.can_eject {
         return true;
     }
@@ -82,7 +64,6 @@ pub fn is_user_relevant(candidate: &MountCandidate<'_>) -> bool {
     }
 
     let Some(mount_point) = candidate.mount_point else {
-        // Not mounted and not removable: nothing to navigate to.
         return false;
     };
 
@@ -93,15 +74,13 @@ pub fn is_user_relevant(candidate: &MountCandidate<'_>) -> bool {
         return false;
     }
 
-    if SYSTEM_PREFIXES.iter().any(|prefix| {
-        // Component-wise, so `/var` does not swallow `/variant-drive`.
-        mount_point.starts_with(prefix)
-    }) {
+    if SYSTEM_PREFIXES
+        .iter()
+        .any(|prefix| mount_point.starts_with(prefix))
+    {
         return false;
     }
 
-    // A real, unmounted-able mount somewhere the user might browse — an extra
-    // internal disk at /mnt/data, for instance.
     candidate.can_unmount || mount_point.starts_with("/mnt") || mount_point.starts_with("/media")
 }
 
@@ -137,7 +116,6 @@ mod tests {
 
     #[test]
     fn removable_media_beats_the_system_prefix_rule() {
-        // /run is a system prefix, but removable media legitimately mounts there.
         let usb = MountCandidate {
             mount_point: Some(Path::new("/run/media/diren/CARD")),
             is_removable: true,
@@ -190,7 +168,6 @@ mod tests {
         };
         assert!(is_user_relevant(&data));
 
-        // Even without an unmount action, /mnt and /media are user areas.
         assert!(is_user_relevant(&at("/mnt/archive")));
         assert!(is_user_relevant(&at("/media/backup")));
     }
@@ -219,9 +196,6 @@ mod tests {
 
     #[test]
     fn the_target_machine_hides_the_whole_section() {
-        // What GIO's built-in Unix monitor reports without gvfs: the system
-        // mounts and nothing the user would browse. The section must be hidden
-        // silently rather than rendered empty.
         let mounts = [
             at("/"),
             at("/boot"),
@@ -263,9 +237,6 @@ mod tests {
 
     #[test]
     fn a_mount_point_sharing_a_prefix_string_is_not_excluded() {
-        // `/var` is an excluded prefix. A disk mounted at `/variant` shares that
-        // string prefix but is a different path component, and must survive — a
-        // naive `str::starts_with` here would silently drop it from the sidebar.
         let candidate = MountCandidate {
             mount_point: Some(Path::new("/variant")),
             can_unmount: true,
@@ -273,7 +244,6 @@ mod tests {
         };
         assert!(is_user_relevant(&candidate));
 
-        // The genuinely-excluded path still is.
         let under_var = MountCandidate {
             mount_point: Some(Path::new("/var/lib/thing")),
             can_unmount: true,

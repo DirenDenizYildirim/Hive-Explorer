@@ -1,9 +1,6 @@
 //! Human-readable formatting for sizes and counts.
-//!
-//! Plain Rust, no GTK, so the rounding rules are unit-tested rather than eyeballed.
 
-/// Format a byte count the way file managers do: binary units, at most one
-/// decimal place, no decimal on whole units or on bytes.
+/// Binary units, at most one decimal place.
 pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
     const STEP: f64 = 1024.0;
@@ -19,8 +16,6 @@ pub fn human_bytes(bytes: u64) -> String {
         unit += 1;
     }
 
-    // One decimal below 10 (2.4 GiB), none above (241 GiB) — the extra digit
-    // stops carrying information once the integer part is large.
     if value < 10.0 {
         format!("{value:.1} {}", UNITS[unit])
     } else {

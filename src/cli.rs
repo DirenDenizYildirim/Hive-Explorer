@@ -1,24 +1,10 @@
 //! Command-line parsing.
-//!
-//! Hand-rolled rather than pulled from a crate: the surface is four forms, and
-//! keeping it here means the parse is unit-tested without a display and without
-//! GApplication's own option machinery getting in the way.
-//!
-//! ```text
-//! hive                  open the home directory
-//! hive PATH             open PATH; if PATH is a file, open its parent and preselect it
-//! hive --select PATH    always reveal: open PATH's parent and preselect PATH
-//! hive --verbose        raise the log level
-//! ```
-//!
-//! `--select` is the stable form other tools use for "reveal in file manager",
-//! so its behavior must not drift.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 
 pub const HELP: &str = "\
-Hive — a Catppuccin file manager for Hyprland
+Hive — minimal pastel explorer
 
 USAGE:
     hive [OPTIONS] [PATH]
@@ -39,11 +25,9 @@ OPTIONS:
 /// What the user asked for on the command line.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Args {
-    /// A path to open, exactly as given — not yet resolved against the working
-    /// directory. [`crate::app`] canonicalizes it in the local process.
+    /// A path to open, exactly as given. Resolution happens in `app`.
     pub target: Option<PathBuf>,
-    /// True when the target came from `--select`, meaning "reveal" even if the
-    /// target is itself a directory.
+    /// True when the target came from `--select`: reveal, even for a directory.
     pub reveal: bool,
     pub verbose: bool,
     pub help: bool,
@@ -68,7 +52,6 @@ where
 {
     let mut parsed = Args::default();
     let mut iter = args.into_iter().map(Into::into).peekable();
-    // Everything after a bare `--` is a path, even if it looks like a flag.
     let mut options_done = false;
 
     while let Some(raw) = iter.next() {
@@ -93,7 +76,6 @@ where
                     set_target(&mut parsed, PathBuf::from(value), true)?;
                 }
                 other => {
-                    // `--select=PATH` form.
                     if let Some(value) = other.strip_prefix("--select=") {
                         if value.is_empty() {
                             return Err(CliError::MissingValue("--select".to_owned()));
@@ -119,8 +101,6 @@ fn set_target(parsed: &mut Args, path: PathBuf, reveal: bool) -> Result<(), CliE
         ));
     }
     parsed.target = Some(path);
-    // `--select` wins over a bare path if both somehow appear; it is the
-    // explicit form.
     parsed.reveal = reveal;
     Ok(())
 }
@@ -151,8 +131,6 @@ mod tests {
 
     #[test]
     fn relative_paths_are_left_unresolved_for_the_local_process() {
-        // Resolution happens in app::, against the invoking shell's cwd. The
-        // parser must not touch it.
         let args = parse_ok(&["."]);
         assert_eq!(args.target, Some(PathBuf::from(".")));
         let args = parse_ok(&["../sibling"]);
@@ -176,7 +154,6 @@ mod tests {
     fn verbose_is_recognized_in_both_forms() {
         assert!(parse_ok(&["--verbose"]).verbose);
         assert!(parse_ok(&["-v"]).verbose);
-        // And alongside a path, in either order.
         let args = parse_ok(&["-v", "/tmp"]);
         assert!(args.verbose);
         assert_eq!(args.target, Some(PathBuf::from("/tmp")));
@@ -196,7 +173,6 @@ mod tests {
 
     #[test]
     fn double_dash_stops_option_parsing() {
-        // A file legitimately named "--verbose" must be openable.
         let args = parse_ok(&["--", "--verbose"]);
         assert_eq!(args.target, Some(PathBuf::from("--verbose")));
         assert!(!args.verbose);

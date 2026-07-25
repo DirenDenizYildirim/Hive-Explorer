@@ -1,7 +1,4 @@
 //! Visibility and search predicates.
-//!
-//! Plain Rust, no GTK. The `gtk::CustomFilter` shim reads a `gio::FileInfo` into
-//! [`FilterInput`] and calls [`matches`].
 
 /// The state the filter is evaluated against.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -29,8 +26,7 @@ impl FilterSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FilterInput<'a> {
     pub name: &'a str,
-    /// gio's `standard::is-hidden` — a leading dot, or a name listed in the
-    /// directory's `.hidden` file.
+    /// gio's `standard::is-hidden`: a leading dot, or listed in `.hidden`.
     pub is_hidden: bool,
     /// gio's `standard::is-backup` — trailing `~` and similar editor leftovers.
     pub is_backup: bool,
@@ -45,8 +41,7 @@ impl<'a> FilterInput<'a> {
         }
     }
 
-    /// Derive hidden-ness from the name alone, for callers without a
-    /// `gio::FileInfo`.
+    /// Derive hidden-ness from the name alone, without a `gio::FileInfo`.
     pub fn from_name(name: &'a str) -> Self {
         Self {
             name,
@@ -70,11 +65,6 @@ pub fn matches(entry: &FilterInput<'_>, spec: &FilterSpec) -> bool {
 }
 
 /// Case-insensitive substring test.
-///
-/// Deliberately allocation-free on the common path and tolerant of non-ASCII:
-/// ASCII letters fold, everything else compares as-is. That is the right
-/// tradeoff for type-as-you-filter, where predictability beats full Unicode
-/// case folding and the predicate runs on every visible row per keystroke.
 pub fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
@@ -91,9 +81,6 @@ pub fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
 }
 
 /// Type-ahead jump: the first entry whose name starts with `prefix`.
-///
-/// Returns an index into `names`, searching from `start` and wrapping, so
-/// repeatedly typing the same letter cycles through matches.
 pub fn type_ahead_match(names: &[&str], prefix: &str, start: usize) -> Option<usize> {
     if prefix.is_empty() || names.is_empty() {
         return None;
@@ -139,8 +126,6 @@ mod tests {
 
     #[test]
     fn gio_hidden_flag_is_honored_even_without_a_leading_dot() {
-        // A name listed in the directory's `.hidden` file has no leading dot but
-        // must still hide.
         let entry = FilterInput::new("lost+found", true, false);
         assert!(!matches(&entry, &FilterSpec::new(false, "")));
         assert!(matches(&entry, &FilterSpec::new(true, "")));
@@ -165,8 +150,6 @@ mod tests {
 
     #[test]
     fn query_still_respects_the_hidden_toggle() {
-        // Searching must not reveal hidden files while the toggle is off — the
-        // filter is a conjunction, not a replacement.
         let dotfile = FilterInput::from_name(".config");
         assert!(!matches(&dotfile, &FilterSpec::new(false, "config")));
         assert!(matches(&dotfile, &FilterSpec::new(true, "config")));
@@ -184,22 +167,15 @@ mod tests {
 
     #[test]
     fn non_ascii_names_match_exactly_and_never_panic() {
-        // Byte-window comparison must never slice a multi-byte character in a
-        // way that panics; eq_ignore_ascii_case on &[u8] is safe by construction.
         let entry = FilterInput::from_name("Straße-Übung-日本語.txt");
 
-        // Non-ASCII substrings match at their own case.
         assert!(matches(&entry, &FilterSpec::new(false, "日本")));
         assert!(matches(&entry, &FilterSpec::new(false, "Straße")));
         assert!(matches(&entry, &FilterSpec::new(false, "Übung")));
 
-        // ASCII within a non-ASCII name still folds.
         assert!(matches(&entry, &FilterSpec::new(false, "TXT")));
         assert!(matches(&entry, &FilterSpec::new(false, "bung")));
 
-        // Documented limitation: folding is ASCII-only, so a lowercase "ü" does
-        // not match an uppercase "Ü". Predictability beats full Unicode case
-        // folding for a predicate that runs on every visible row per keystroke.
         assert!(!matches(&entry, &FilterSpec::new(false, "übung")));
 
         assert!(!matches(&entry, &FilterSpec::new(false, "zzz")));
@@ -216,9 +192,7 @@ mod tests {
     fn type_ahead_finds_and_wraps() {
         let names = ["alpha", "beta", "Bravo", "gamma"];
         assert_eq!(type_ahead_match(&names, "b", 0), Some(1));
-        // Starting past the first match continues to the next.
         assert_eq!(type_ahead_match(&names, "b", 2), Some(2));
-        // Wraps around the end of the list.
         assert_eq!(type_ahead_match(&names, "a", 2), Some(0));
         assert_eq!(type_ahead_match(&names, "z", 0), None);
         assert_eq!(type_ahead_match(&names, "", 0), None);

@@ -1,9 +1,4 @@
 //! The single [`gtk::CssProvider`] through which every theme is applied.
-//!
-//! There is exactly one provider for the lifetime of the process. Switching
-//! flavors reloads its data; it is never added twice, never removed, and no
-//! widget is rebuilt. That is what makes a flavor switch flicker-free — GTK
-//! recomputes styles in place and animates nothing structural.
 
 use gtk::gdk;
 
@@ -19,14 +14,10 @@ pub struct ThemeProvider {
 impl ThemeProvider {
     /// Install the provider on `display`.
     ///
-    /// Registered *above* `STYLE_PROVIDER_PRIORITY_USER`, not at
-    /// `STYLE_PROVIDER_PRIORITY_APPLICATION`. A system GTK theme symlinked into
-    /// `~/.config/gtk-4.0/gtk.css` loads at USER (800), which outranks
-    /// APPLICATION (600) — so at the lower priority a user running, say, a
-    /// system-wide Catppuccin Mocha theme would silently override Hive's
-    /// palette, and picking Latte in Hive would half-apply. The requirement is
-    /// that the flavor chosen in Hive always wins and always works, which means
-    /// outranking the user stylesheet for this application's widgets.
+    /// Registered above `PRIORITY_USER`, not at `PRIORITY_APPLICATION`. A system
+    /// GTK theme symlinked into ~/.config/gtk-4.0/gtk.css loads at USER (800),
+    /// which outranks APPLICATION (600) — at the lower priority it silently
+    /// overrides Hive's palette and the flavor picked in Hive only half-applies.
     pub fn install(display: &gdk::Display) -> Self {
         let provider = gtk::CssProvider::new();
         gtk::style_context_add_provider_for_display(display, &provider, Self::PRIORITY);
@@ -37,10 +28,6 @@ impl ThemeProvider {
     pub const PRIORITY: u32 = gtk::STYLE_PROVIDER_PRIORITY_USER + 1;
 
     /// A provider not attached to any display.
-    ///
-    /// Only reachable when GTK has no display at all, where nothing will render
-    /// regardless. It exists so that case degrades to "unstyled" instead of
-    /// unwrapping a `None`.
     pub fn detached() -> Self {
         Self {
             provider: gtk::CssProvider::new(),
@@ -48,11 +35,6 @@ impl ThemeProvider {
     }
 
     /// Regenerate and apply the stylesheet for `palette`.
-    ///
-    /// `load_from_string` never fails loudly — GTK reports CSS problems through
-    /// the provider's `parsing-error` signal, which [`Self::connect_diagnostics`]
-    /// routes into the log. A malformed stylesheet therefore degrades to
-    /// partially-applied styling rather than a crash.
     pub fn apply(&self, palette: &Palette, options: &StyleOptions) {
         let stylesheet = css::generate(palette, options);
         tracing::debug!(
@@ -75,8 +57,7 @@ impl ThemeProvider {
         });
     }
 
-    /// Keep libadwaita's light/dark machinery in step with the active palette,
-    /// so stock widgets that branch on color scheme pick the right variant.
+    /// Keep libadwaita's light/dark machinery in step with the active palette.
     pub fn sync_color_scheme(palette: &Palette) {
         let scheme = if palette.dark {
             adw::ColorScheme::ForceDark
