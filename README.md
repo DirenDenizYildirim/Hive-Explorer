@@ -5,9 +5,11 @@ Minimal pastel explorer — a file manager for Hyprland, written in Rust with GT
 Priority order: **stability > visual polish > feature count.** A small set of operations that never fail is
 worth more than a wide feature set that occasionally corrupts or hangs.
 
-> **Status: milestones (a) and (b) of 6.** The window, sidebar, theming system, config layer, non-blocking
-> progressive listing, navigation, full keyboard support, and the CLI are in place. File operations, undo,
-> folder colors, and thumbnails are not built yet. See [Roadmap](#roadmap).
+> **Status: milestones (a), (b) and (c) of 6.** The window, sidebar, theming system, config layer,
+> non-blocking progressive listing, navigation, full keyboard support, the CLI, and the whole file-operation
+> layer — copy, move, rename, trash, delete, undo, with conflict handling and pre-flight checks — are in
+> place. The theme switcher UI, folder colors, thumbnails and the properties dialog are not built yet. See
+> [Roadmap](#roadmap).
 
 ---
 
@@ -112,10 +114,34 @@ process (`gio::ApplicationFlags::HANDLES_OPEN`).
 | `Ctrl+T` | Toggle list / grid view |
 | `F9` | Toggle sidebar |
 | Arrows, `Home`/`End`, `Page Up`/`Down` | Move the selection |
+| Click-drag, `Ctrl+click`, `Shift+click` | Multi-select |
 | Type any letters | Type-ahead jump to the next matching name |
+| `Right-click`, `Menu`, `Shift+F10` | Context menu |
+
+File operations:
+
+| Key | Action |
+|---|---|
+| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste |
+| `Ctrl+D` | Duplicate — always keeps both, never asks |
+| `F2` | Rename |
+| `Delete` | Move to Trash |
+| `Shift+Delete` | Delete permanently, behind a confirmation |
+| `Ctrl+Shift+N` | New folder |
+| `Ctrl+Z` | Undo |
 
 Type-ahead is why `Ctrl+F` is an explicit shortcut rather than start-typing-to-search: bare typing jumps to a
 name, and only `Ctrl+F` opens the filter.
+
+The file-operation keys are shortcuts on the window in GTK's *bubble* phase, not application accelerators.
+That ordering matters: an application accelerator is handled above the focused widget, so `Delete` inside the
+rename dialog would trash your selection instead of deleting a character, and `Ctrl+A` in the path entry would
+select every file rather than the text. In the bubble phase the focused widget gets first refusal and only
+what it does not want reaches the file actions — while they still work with focus on the sidebar or a header
+button, which a shortcut scoped to the list would not.
+
+New File has no key. It is on the main menu and the context menu; there is no conventional binding for it and
+inventing one costs a key that something else may want.
 
 ### Vim keys
 
@@ -127,8 +153,6 @@ Off by default. Set `vim_keys = true` under `[behavior]`:
 | `h` | Parent folder |
 | `l` | Enter / open |
 | `gg` / `G` | First / last entry |
-
-Still planned: `Del` trash, `Shift+Del` permanent delete, `Ctrl+Z` undo, `F2` rename, `Ctrl+C`/`X`/`V`.
 
 ---
 
@@ -277,6 +301,68 @@ hyprctl clients | grep -i dev.diren.Hive
 
 ---
 
+## File operations
+
+Everything that touches more than one file runs on a worker thread. The UI never blocks on the filesystem,
+including on a mount that has stopped answering.
+
+**Before a copy or move starts**, off the main thread and cancellable:
+
+1. Copying or moving a folder **into its own subtree, or onto itself, is refused** — compared on canonicalized
+   paths, before a single byte moves. This is the classic recursive data-eater.
+2. The sources are walked for a total byte and item count. The walk shows an indeterminate indicator, because
+   until it finishes there is no honest denominator to show.
+3. Free space at the target is read via gio's `filesystem::free` and compared. If it does not fit, Hive
+   **refuses before starting** and shows required versus available, rather than dying at 90% with half a tree
+   written. A filesystem that reports no figure is not treated as full.
+4. Source and target `id::filesystem` are compared. A same-filesystem move is an instant rename; anything else
+   copies. The progress dialog says which, because that decides whether you wait or walk away.
+
+A cross-filesystem move is copy-then-delete, and each source is removed only after **its own** copy has fully
+succeeded. Cancelling therefore leaves every file in exactly one place — never zero, never two.
+
+**Conflicts are never resolved silently.** A name that is already taken raises a dialog offering
+**Replace**, **Keep Both**, **Skip** and **Cancel**, showing the size and date of both sides, with a
+"do this for everything else" checkbox. Keep Both shows the exact name it would use. Two directories with the
+same name **merge**; anything else replaces.
+
+The progress dialog only appears once an operation has been running for 400 ms, so the common case of copying
+a handful of files never puts a dialog on screen at all.
+
+### Undo (`Ctrl+Z`)
+
+A bounded in-session stack of **20 entries**, not persisted across restarts. No redo in v1.
+
+| Operation | Inverse |
+|---|---|
+| Trash | Restore from the recorded trash location — never guessed by name |
+| Rename | Rename back |
+| Move | Move back to the original parent |
+| Copy / duplicate | Delete the files that were created |
+| New folder / new file | Delete it |
+
+**Permanent delete is never on the stack.** It has no inverse and cannot be represented, let alone pushed.
+
+**Undo never destroys data.** Before applying an inverse Hive re-validates: does the source still exist, is the
+target path still free, and has anything changed since? If a copied file has been *edited* since the copy,
+undoing would discard those edits, so the entry is refused with a toast explaining why and dropped. For a
+copied *folder* the check looks below the top level — a folder's own mtime says nothing about a file edited
+three levels down, and deleting the folder would take that edit with it.
+
+Two consequences worth knowing:
+
+- **A replaced file is not recorded.** Undoing a copy deletes what Hive created, which cannot bring back what
+  Replace destroyed — so deleting it too would only make things worse. Replaced targets are deliberately left
+  out. The conflict dialog says "Replacing it cannot be undone" for this reason. A *move* is different:
+  putting the source back destroys nothing, so it is recorded.
+- **A partially completed operation records only what actually completed**, and an operation that created more
+  than 10,000 recordable entries is reported as not undoable rather than storing an inverse that no longer
+  fits a bounded stack.
+
+Only one operation runs at a time. Queueing is out of scope for v1.
+
+---
+
 ## Decided behavior for known hazards
 
 Every item here is a trap that file managers routinely fall into. Each has a decided behavior rather than an
@@ -285,13 +371,13 @@ accident.
 | # | Hazard | Decision | Status |
 |---|---|---|---|
 | 1 | **Recursive folder size is an unbounded tree walk** | Never computed automatically. The Properties dialog shows size behind an explicit **Calculate** button, run off-thread, cancellable, updating incrementally. | milestone (f) |
-| 2 | **Wayland clipboard dies with the process** | Copying a file and then closing Hive loses the clipboard, because Wayland clipboard content is owned by the client. Hive shows a confirmation on quit *only* while it actually owns a file clipboard, with a "don't ask again" option (`warn_clipboard_on_quit`). Running `wl-clip-persist` makes this moot. | milestone (c) |
-| 3 | **Clipboard format interop** | Hive offers and accepts both `text/uri-list` and `x-special/gnome-copied-files`; the latter carries the cut-vs-copy distinction. Without both, copy/paste appears to work but only inside Hive. | milestone (c) |
-| 4 | **Trash fails on removable drives** | FAT/exFAT cannot host the per-mount `.Trash-$uid` the freedesktop spec wants. `Del` detects the failure and offers permanent delete through a clear dialog. It never silently does nothing, and never silently permanently deletes instead. | milestone (c) |
+| 2 | **Wayland clipboard dies with the process** | Copying a file and then closing Hive loses the clipboard, because Wayland clipboard content is owned by the client. Closing the window while Hive still owns a file clipboard asks first — **Don't Quit** / **Quit Anyway** — and names what would be lost. It asks *only* while Hive actually owns it: the moment another application takes the clipboard the warning stops. Set `warn_clipboard_on_quit = false` to turn it off, or run `wl-clip-persist`, which makes the whole problem moot. | done |
+| 3 | **Clipboard format interop** | Hive offers and accepts both `text/uri-list` and `x-special/gnome-copied-files`; the latter carries the cut-vs-copy distinction. A plain-text form rides along so pasting into a terminal gives the paths. A `text/uri-list` arriving from another application says nothing about intent and is read as a **copy** — treating an ambiguous paste as a move would delete that application's files. | done |
+| 4 | **Trash fails on removable drives** | FAT/exFAT cannot host the per-mount `.Trash-$uid` the freedesktop spec wants, and neither can `tmpfs`. `Delete` detects the failure and offers permanent delete through a clear dialog. It never silently does nothing, and never silently permanently deletes instead. | done |
 | 5 | **Thumbnail cache staleness** | The cache is keyed on **(path, mtime, size)**, not path alone, so an edited image does not show its old thumbnail forever. | milestone (f) |
-| 6 | **Case-only rename** (`foo` → `Foo`) | Detected and performed as a two-step rename through a temporary name, which is required on case-insensitive/case-preserving filesystems. | milestone (c) |
-| 7 | **Symlink copy semantics** | **Default: copy the link itself, not its target** (`NOFOLLOW_SYMLINKS`). Set `follow_symlinks_on_copy = true` to invert the default, or hold `Shift` to follow for a single operation. | milestone (c) |
-| 8 | **Self-referential operations** | Renaming or deleting the directory currently being viewed navigates to a safe parent rather than sitting on a dead path. Cut-then-paste into the same directory is a no-op, not a duplicate and not a deletion. | milestone (c) |
+| 6 | **Case-only rename** (`foo` → `Foo`) | Detected and performed as a two-step rename through a hidden staging name in the same directory. Unconditional rather than conditional on detecting the filesystem, because that cannot be done reliably and the direct rename may *destroy* the file rather than merely fail. If the second step fails the staging name is renamed back. | done |
+| 7 | **Symlink copy semantics** | **Default: copy the link itself, not its target** (`NOFOLLOW_SYMLINKS`), so a broken link copies as a broken link rather than failing. Set `follow_symlinks_on_copy = true` under `[behavior]` to copy targets instead; there is no per-operation modifier, because a destructive default that changes with a held key is exactly the implicit behavior the spec rules out. | done |
+| 8 | **Self-referential operations** | Renaming or deleting the directory currently being viewed walks up to the **nearest surviving ancestor** rather than sitting on a dead path or jumping all the way Home. Cut-then-paste into the same directory is a no-op, not a duplicate and not a deletion. Copying or moving a folder into its own subtree, or onto itself, is refused before a single byte moves. | done |
 
 Two more decisions that are already live in milestone (a):
 
@@ -311,11 +397,15 @@ Two more decisions that are already live in milestone (a):
 
 ```
 src/
-  model/     sort comparators, filter predicate, path normalization   — no GTK, unit-tested
-  config/    versioned schema, atomic writes, malformed-file recovery — no GTK, unit-tested
+  model/     sort comparators, filter predicate, path normalization,
+             the undo stack and its re-validation, copy/move pre-flight,
+             clipboard payload formats, trashinfo parsing               — no GTK, unit-tested
+  config/    versioned schema, atomic writes, malformed-file recovery   — no GTK, unit-tested
   theme/     palette types, Catppuccin constants, CSS generator       — no GTK except provider.rs
-  fs/        places resolution, volume relevance                      — policy is plain Rust
-  ui/        window, sidebar, breadcrumb, file pane, status bar       — GTK layer, holds no policy
+  fs/        places resolution, volume relevance, the off-thread
+             operation worker, trashing and restoring                 — policy is plain Rust
+  ui/        window, sidebar, breadcrumb, file pane, status bar,
+             clipboard, dialogs, progress, context menu               — GTK layer, holds no policy
   app.rs     adw::Application, HANDLES_OPEN, startup
   cli.rs     argument parsing                                         — unit-tested
 ```
@@ -431,16 +521,27 @@ Items marked *(a)* are verifiable now; the rest arrive with their milestone.
 - [ ] Plugging in a USB stick makes Devices appear; ejecting removes it.
 - [ ] Yanking a drive mid-browse falls back to Home with a non-blocking banner and never crashes.
 
-**File operations** *(milestone c)*
+**File operations**
 
-- [ ] Copy/move conflicts offer Replace / Skip / Rename / Apply to all — never a silent overwrite.
-- [ ] Copying a directory into its own subtree is refused before a single byte moves.
-- [ ] Insufficient free space is refused up front, showing required vs available.
-- [ ] A same-filesystem move reports as instant; a cross-filesystem move reports as copy-then-delete.
-- [ ] A cross-filesystem move deletes the source only after the copy fully succeeds.
-- [ ] `Ctrl+Z` reverses trash, rename, move, copy, duplicate, and create.
-- [ ] Undo refuses, with an explanation, when a copied file has been edited since the copy.
-- [ ] Permanent delete never appears on the undo stack.
+- [ ] *(c)* Copy/move conflicts offer Replace / Keep Both / Skip / Cancel with "do this for everything else" — never a silent overwrite.
+- [ ] *(c)* Copying a directory into its own subtree, or onto itself, is refused before a single byte moves.
+- [ ] *(c)* Insufficient free space is refused up front, showing required vs available.
+- [ ] *(c)* A cross-filesystem move deletes each source only after its own copy fully succeeds.
+- [ ] *(c)* A same-filesystem move reports as instant; a cross-filesystem move reports as copy-then-delete.
+- [ ] *(c)* Cancelling mid-copy stops promptly and reports how many items were already done.
+- [ ] *(c)* `Ctrl+Z` reverses trash, rename, move, copy, duplicate, and create.
+- [ ] *(c)* Undo of a trash restores from the recorded location and removes the trash entry.
+- [ ] *(c)* Undo refuses, with an explanation, when a copied file has been edited since the copy.
+- [ ] *(c)* Permanent delete never appears on the undo stack.
+- [ ] *(c)* `Delete` on a filesystem with no Trash offers permanent delete instead of failing silently.
+- [ ] *(c)* Copying a symlink copies the link, not its target; a broken link copies without an error.
+- [ ] *(c)* A file with a newline or invalid UTF-8 in its name copies, pastes, and shows the right name.
+- [ ] *(c)* `Delete` and `Ctrl+A` inside the rename dialog and the path entry edit text — they do not touch files.
+- [ ] *(c)* Cut-then-paste into the same folder is a no-op, not a duplicate and not a deletion.
+- [ ] *(c)* Deleting the folder being viewed lands on the nearest surviving parent, not Home.
+- [ ] *(c)* Closing the window while Hive owns a file clipboard asks before quitting.
+- [ ] Pasting into Nautilus or Thunar works, and Hive pastes what they copied — including cut.
+- [ ] A large copy onto a slow USB stick shows progress and cancels promptly.
 
 ---
 
@@ -451,7 +552,10 @@ Items marked *(a)* are verifiable now; the rest arrive with their milestone.
 - **(b) — done.** History with back/forward, parent, mouse side buttons, `Ctrl+L` path entry with tab
   completion, `Ctrl+F` filter, `Ctrl+A`, type-ahead, optional vim keys, opening files through `gio::AppInfo`,
   `--select` reveal, and single-instance handoff.
-- **(c)** File operations with conflict handling, progress and cancel, copy/move pre-flight, and undo.
+- **(c) — done.** Copy, cut, paste, move, rename, duplicate, trash, permanent delete, new folder and new
+  file, all on a worker thread with progress and cancel; the copy/move pre-flight checks; conflict handling;
+  and a 20-entry undo stack with re-validation. Clipboard interop with other file managers, and the trash,
+  case-only-rename, symlink and self-reference hazards.
 - **(d)** Theming UI: flavor switcher, live swap, accent setting, follow-system, user-theme directory.
 - **(e)** Folder colors and sidebar pinning.
 - **(f)** Polish: thumbnails, properties dialog with opt-in cancellable recursive size, status line, animations.

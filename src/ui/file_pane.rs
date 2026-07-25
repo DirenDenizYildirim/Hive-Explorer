@@ -34,7 +34,13 @@ struct ViewState {
 }
 
 pub struct FilePane {
-    container: gtk::Stack,
+    /// A plain box wrapping the view stack.
+    ///
+    /// The context-menu popover parents itself here rather than to the stack,
+    /// which manages its children as pages and is a poor host for one it does
+    /// not know about.
+    container: gtk::Box,
+    stack: gtk::Stack,
     directory_list: gtk::DirectoryList,
     filter_model: gtk::FilterListModel,
     sort_model: gtk::SortListModel,
@@ -52,6 +58,12 @@ pub struct FilePane {
     /// loading finishes without it showing up.
     pending_selection: RefCell<Option<PathBuf>>,
     mode: Cell<ViewMode>,
+    /// Set by a row's own right-click handler, read by the view's.
+    ///
+    /// Neither `GtkColumnView` nor `GtkGridView` can name the row under a
+    /// point, so the rows report themselves: the row gesture runs first in the
+    /// bubble phase and leaves its position here for the view gesture to take.
+    right_clicked: Rc<Cell<Option<u32>>>,
 }
 
 impl FilePane {
@@ -123,17 +135,22 @@ impl FilePane {
 
         let selection = gtk::MultiSelection::new(Some(sort_model.clone()));
 
-        let column_view = build_column_view(&selection);
-        let grid_view = build_grid_view(&selection);
+        let right_clicked = Rc::new(Cell::new(None));
+        let column_view = build_column_view(&selection, &right_clicked);
+        let grid_view = build_grid_view(&selection, &right_clicked);
 
-        let container = gtk::Stack::new();
-        container.set_transition_type(gtk::StackTransitionType::None);
-        container.add_named(&scrolled(&column_view), Some(ViewMode::List.id()));
-        container.add_named(&scrolled(&grid_view), Some(ViewMode::Grid.id()));
+        let stack = gtk::Stack::new();
+        stack.set_transition_type(gtk::StackTransitionType::None);
+        stack.add_named(&scrolled(&column_view), Some(ViewMode::List.id()));
+        stack.add_named(&scrolled(&grid_view), Some(ViewMode::Grid.id()));
+
+        let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        container.append(&stack);
         container.add_css_class("hive-file-pane");
 
         Rc::new(Self {
             container,
+            stack,
             directory_list,
             filter_model,
             sort_model,
@@ -145,10 +162,11 @@ impl FilePane {
             grid_view,
             pending_selection: RefCell::new(None),
             mode: Cell::new(ViewMode::List),
+            right_clicked,
         })
     }
 
-    pub fn widget(&self) -> &gtk::Stack {
+    pub fn widget(&self) -> &gtk::Box {
         &self.container
     }
 
@@ -198,7 +216,7 @@ impl FilePane {
     /// Switch between list and grid. A stack page change only; nothing re-enumerates.
     pub fn set_view_mode(&self, mode: ViewMode) {
         self.mode.set(mode);
-        self.container.set_visible_child_name(mode.id());
+        self.stack.set_visible_child_name(mode.id());
     }
 
     pub fn view_mode(&self) -> ViewMode {
@@ -421,6 +439,36 @@ impl FilePane {
         self.directory_list.connect_loading_notify(move |_| h());
     }
 
+    /// Run `handler` on a right-click, with the row's position when there is one.
+    ///
+    /// Coordinates are relative to the pane's own container, so the caller can
+    /// point a popover straight at them.
+    pub fn connect_context_menu(&self, handler: impl Fn(Option<u32>, f64, f64) + 'static) {
+        let handler = Rc::new(handler);
+
+        for view in [
+            self.column_view.clone().upcast::<gtk::Widget>(),
+            self.grid_view.clone().upcast::<gtk::Widget>(),
+        ] {
+            let gesture = gtk::GestureClick::builder().button(3).build();
+            let handler = Rc::clone(&handler);
+            let right_clicked = Rc::clone(&self.right_clicked);
+            let container = self.container.clone();
+            let source = view.clone();
+
+            gesture.connect_pressed(move |gesture, _, x, y| {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                let position = right_clicked.take();
+                let point = source
+                    .compute_point(&container, &gtk::graphene::Point::new(x as f32, y as f32))
+                    .unwrap_or_else(|| gtk::graphene::Point::new(x as f32, y as f32));
+                handler(position, f64::from(point.x()), f64::from(point.y()));
+            });
+
+            view.add_controller(gesture);
+        }
+    }
+
     /// Notify when enumeration fails: permission denied, vanished, unmounted.
     pub fn connect_error(&self, handler: impl Fn(glib::Error) + 'static) {
         self.directory_list.connect_error_notify(move |list| {
@@ -458,7 +506,36 @@ fn scrolled(child: &impl IsA<gtk::Widget>) -> gtk::ScrolledWindow {
         .build()
 }
 
-fn build_column_view(selection: &gtk::MultiSelection) -> gtk::ColumnView {
+/// Let a row announce itself when right-clicked, and select it if it was not.
+fn watch_right_click(
+    item: &gtk::ListItem,
+    child: &impl IsA<gtk::Widget>,
+    right_clicked: &Rc<Cell<Option<u32>>>,
+    selection: &gtk::MultiSelection,
+) {
+    let gesture = gtk::GestureClick::builder().button(3).build();
+    let right_clicked = Rc::clone(right_clicked);
+    let selection = selection.clone();
+    let item = item.clone();
+
+    gesture.connect_pressed(move |_, _, _, _| {
+        let position = item.position();
+        right_clicked.set(Some(position));
+
+        // Acting on a row the user cannot see highlighted is a good way to
+        // delete the wrong thing.
+        if !selection.selection().contains(position) {
+            selection.select_item(position, true);
+        }
+    });
+
+    child.as_ref().add_controller(gesture);
+}
+
+fn build_column_view(
+    selection: &gtk::MultiSelection,
+    right_clicked: &Rc<Cell<Option<u32>>>,
+) -> gtk::ColumnView {
     let view = gtk::ColumnView::builder()
         .model(selection)
         .show_row_separators(false)
@@ -468,7 +545,8 @@ fn build_column_view(selection: &gtk::MultiSelection) -> gtk::ColumnView {
         .vexpand(true)
         .build();
 
-    view.append_column(&name_column());
+    view.set_enable_rubberband(true);
+    view.append_column(&name_column(selection, right_clicked));
 
     let size_column = text_column("Size", |info| {
         if is_directory(info) {
@@ -479,10 +557,13 @@ fn build_column_view(selection: &gtk::MultiSelection) -> gtk::ColumnView {
     });
     view.append_column(&size_column);
 
+    // gio hands back a UTC timestamp; formatting it directly would show every
+    // file three hours off here, and disagree with the conflict dialog.
     let modified_column = text_column("Modified", |info| {
         info.modification_date_time()
-            .and_then(|dt| dt.format("%Y-%m-%d %H:%M").ok())
-            .map(|s| s.to_string())
+            .and_then(|time| time.to_local().ok())
+            .and_then(|local| local.format("%Y-%m-%d %H:%M").ok())
+            .map(|text| text.to_string())
             .unwrap_or_default()
     });
     view.append_column(&modified_column);
@@ -504,10 +585,15 @@ fn build_column_view(selection: &gtk::MultiSelection) -> gtk::ColumnView {
     view
 }
 
-fn name_column() -> gtk::ColumnViewColumn {
+fn name_column(
+    selection: &gtk::MultiSelection,
+    right_clicked: &Rc<Cell<Option<u32>>>,
+) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
 
-    factory.connect_setup(|_, item| {
+    let selection = selection.clone();
+    let right_clicked = Rc::clone(right_clicked);
+    factory.connect_setup(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
         };
@@ -523,6 +609,7 @@ fn name_column() -> gtk::ColumnViewColumn {
         row.append(&icon);
         row.append(&label);
         item.set_child(Some(&row));
+        watch_right_click(item, &row, &right_clicked, &selection);
     });
 
     factory.connect_bind(|_, item| {
@@ -609,10 +696,15 @@ fn text_column(
         .build()
 }
 
-fn build_grid_view(selection: &gtk::MultiSelection) -> gtk::GridView {
+fn build_grid_view(
+    selection: &gtk::MultiSelection,
+    right_clicked: &Rc<Cell<Option<u32>>>,
+) -> gtk::GridView {
     let factory = gtk::SignalListItemFactory::new();
 
-    factory.connect_setup(|_, item| {
+    let for_setup = selection.clone();
+    let right_clicked = Rc::clone(right_clicked);
+    factory.connect_setup(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
         };
@@ -637,6 +729,7 @@ fn build_grid_view(selection: &gtk::MultiSelection) -> gtk::GridView {
         cell.append(&icon);
         cell.append(&label);
         item.set_child(Some(&cell));
+        watch_right_click(item, &cell, &right_clicked, &for_setup);
     });
 
     factory.connect_bind(|_, item| {
@@ -676,6 +769,7 @@ fn build_grid_view(selection: &gtk::MultiSelection) -> gtk::GridView {
         .factory(&factory)
         .max_columns(24)
         .min_columns(1)
+        .enable_rubberband(true)
         .hexpand(true)
         .vexpand(true)
         .build()

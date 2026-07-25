@@ -128,10 +128,15 @@ impl Breadcrumb {
             }
         }
 
-        // The viewport can clip when the window is very narrow. Scroll to the
-        // end so what gets clipped is the ancestors, never the directory the
-        // user is actually in. Deferred, because the adjustment's upper bound
-        // is not known until the new buttons have been allocated.
+        self.scroll_to_current();
+    }
+
+    /// Keep the directory the user is in visible, clipping ancestors instead.
+    ///
+    /// Deferred, because the adjustment's upper bound is not known until the
+    /// new buttons have been allocated. Also called when the breadcrumb comes
+    /// back from behind the path entry, which resets the scroll position.
+    pub fn scroll_to_current(&self) {
         let adjustment = self.viewport.hadjustment();
         glib::idle_add_local_once(move || {
             adjustment.set_value(adjustment.upper());

@@ -44,10 +44,22 @@ pub enum Job {
         sources: Vec<PathBuf>,
         destination: PathBuf,
         follow_symlinks: bool,
+        /// A decision made up front, so the worker never asks. Duplicate uses
+        /// it: the conflict is with the original and the answer is always
+        /// "keep both", so a dialog would only be in the way.
+        blanket: Option<Action>,
     },
     Trash(Vec<PathBuf>),
     /// Permanent delete. Never recorded for undo — it has no inverse.
     Delete(Vec<PathBuf>),
+    Rename {
+        path: PathBuf,
+        name: String,
+    },
+    Create {
+        path: PathBuf,
+        directory: bool,
+    },
     /// Undo of a trash.
     Restore(Vec<Trashed>),
     /// Undo of a move or rename.
@@ -68,9 +80,29 @@ impl Job {
             } => "Moving",
             Job::Trash(_) => "Moving to Trash",
             Job::Delete(_) => "Deleting",
+            Job::Rename { .. } => "Renaming",
+            Job::Create { .. } => "Creating",
             Job::Restore(_) => "Restoring from Trash",
             Job::Revert(_) => "Undoing",
             Job::Discard(_) => "Undoing",
+        }
+    }
+
+    /// How the summary toast names what happened.
+    pub const fn past_tense(&self) -> &'static str {
+        match self {
+            Job::Transfer {
+                kind: Kind::Copy, ..
+            } => "Copied",
+            Job::Transfer {
+                kind: Kind::Move, ..
+            } => "Moved",
+            Job::Trash(_) => "Moved to Trash",
+            Job::Delete(_) => "Deleted",
+            Job::Rename { .. } => "Renamed",
+            Job::Create { .. } => "Created",
+            Job::Restore(_) => "Restored",
+            Job::Revert(_) | Job::Discard(_) => "Undid",
         }
     }
 }
@@ -266,9 +298,15 @@ impl Worker {
                 sources,
                 destination,
                 follow_symlinks,
-            } => self.transfer(kind, sources, destination, follow_symlinks),
+                blanket,
+            } => {
+                self.blanket = blanket;
+                self.transfer(kind, sources, destination, follow_symlinks);
+            }
             Job::Trash(paths) => self.trash(paths),
             Job::Delete(paths) => self.delete(paths),
+            Job::Rename { path, name } => self.rename_one(path, &name),
+            Job::Create { path, directory } => self.create_one(path, directory),
             Job::Restore(items) => self.restore(items),
             Job::Revert(items) => self.revert(items),
             Job::Discard(items) => self.discard(items),
@@ -793,6 +831,48 @@ impl Worker {
         }
     }
 
+    fn rename_one(&mut self, path: PathBuf, name: &str) {
+        self.total = Survey { items: 1, bytes: 0 };
+        match rename(&path, name) {
+            Ok(target) => {
+                self.outcome.moved.push(Moved {
+                    from: path,
+                    to: target,
+                });
+                self.done_items = 1;
+                self.outcome.finished_items = 1;
+            }
+            Err(message) => self.error(&path, message),
+        }
+    }
+
+    fn create_one(&mut self, path: PathBuf, directory: bool) {
+        self.total = Survey { items: 1, bytes: 0 };
+
+        if exists(&path) {
+            self.error(&path, "already exists");
+            return;
+        }
+
+        let created = if directory {
+            std::fs::create_dir(&path)
+        } else {
+            std::fs::File::create_new(&path).map(drop)
+        };
+
+        match created {
+            Ok(()) => match created_entry(&path) {
+                Some(entry) => {
+                    self.outcome.created.push(entry);
+                    self.done_items = 1;
+                    self.outcome.finished_items = 1;
+                }
+                None => self.error(&path, "vanished immediately after being created"),
+            },
+            Err(error) => self.error(&path, error),
+        }
+    }
+
     fn restore(&mut self, items: Vec<Trashed>) {
         self.total = Survey {
             items: items.len() as u64,
@@ -902,6 +982,56 @@ pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf, String> {
     std::fs::rename(path, &target)
         .map(|()| target)
         .map_err(|error| error.to_string())
+}
+
+/// How many entries undo's validation walk will look at before giving up.
+///
+/// Giving up reports "unknown", which validation reads as modified and so
+/// refuses — the safe direction, and the one that keeps Ctrl+Z from stalling
+/// the main loop on a tree with a hundred thousand files in it.
+const MAX_VALIDATION_WALK: usize = 100_000;
+
+/// The real filesystem, as [`crate::model::undo`] validation sees it.
+pub struct Filesystem;
+
+impl crate::model::undo::Probe for Filesystem {
+    fn exists(&self, path: &Path) -> bool {
+        exists(path)
+    }
+
+    fn stamp(&self, path: &Path) -> Option<Stamp> {
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|metadata| Stamp::of(&metadata))
+    }
+
+    fn newest_within(&self, path: &Path) -> Option<i64> {
+        let mut budget = MAX_VALIDATION_WALK;
+        newest_within(path, &mut budget)
+    }
+}
+
+fn newest_within(path: &Path, budget: &mut usize) -> Option<i64> {
+    if *budget == 0 {
+        return Some(i64::MAX);
+    }
+    *budget -= 1;
+
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    let mut newest = Stamp::of(&metadata).modified;
+
+    if metadata.is_dir()
+        && !metadata.is_symlink()
+        && let Ok(listing) = std::fs::read_dir(path)
+    {
+        for entry in listing.flatten() {
+            if let Some(found) = newest_within(&entry.path(), budget) {
+                newest = newest.max(found);
+            }
+        }
+    }
+
+    Some(newest)
 }
 
 /// Record what an entry looked like the moment Hive finished creating it.
@@ -1067,6 +1197,7 @@ mod tests {
             sources: sources.to_vec(),
             destination: destination.to_path_buf(),
             follow_symlinks: false,
+            blanket: None,
         }
     }
 
@@ -1076,6 +1207,7 @@ mod tests {
             sources: sources.to_vec(),
             destination: destination.to_path_buf(),
             follow_symlinks: false,
+            blanket: None,
         }
     }
 
@@ -1299,6 +1431,7 @@ mod tests {
                 sources: vec![src.join("link")],
                 destination: dst.clone(),
                 follow_symlinks: true,
+                blanket: None,
             },
             never_conflicts,
         );
@@ -1337,6 +1470,7 @@ mod tests {
                 sources: vec![loop_dir],
                 destination: dst.clone(),
                 follow_symlinks: true,
+                blanket: None,
             },
             never_conflicts,
         );
@@ -1455,6 +1589,94 @@ mod tests {
         assert!(!dst.join("tree").exists());
         assert_eq!(std::fs::read(dst.join("untouched.txt")).unwrap(), b"keep");
         assert!(src.join("tree/a").exists(), "the original is untouched");
+    }
+
+    #[test]
+    fn a_rename_job_reports_where_the_entry_ended_up() {
+        let (_root, src, _dst) = workspace();
+        let path = src.join("before.txt");
+        std::fs::write(&path, b"x").unwrap();
+
+        let outcome = run(
+            Job::Rename {
+                path: path.clone(),
+                name: "after.txt".to_owned(),
+            },
+            never_conflicts,
+        );
+
+        assert!(outcome.is_clean(), "{:?}", outcome.errors);
+        assert_eq!(outcome.moved.len(), 1);
+        assert_eq!(outcome.moved[0].from, path);
+        assert_eq!(outcome.moved[0].to, src.join("after.txt"));
+        assert!(src.join("after.txt").exists());
+    }
+
+    #[test]
+    fn a_create_job_records_what_it_made() {
+        let (_root, src, _dst) = workspace();
+
+        let folder = run(
+            Job::Create {
+                path: src.join("New Folder"),
+                directory: true,
+            },
+            never_conflicts,
+        );
+        assert!(folder.is_clean(), "{:?}", folder.errors);
+        assert!(src.join("New Folder").is_dir());
+        assert_eq!(folder.created.len(), 1);
+        assert!(folder.created[0].is_dir);
+
+        let file = run(
+            Job::Create {
+                path: src.join("notes.txt"),
+                directory: false,
+            },
+            never_conflicts,
+        );
+        assert!(file.is_clean(), "{:?}", file.errors);
+        assert_eq!(std::fs::metadata(src.join("notes.txt")).unwrap().len(), 0);
+        assert!(!file.created[0].is_dir);
+    }
+
+    #[test]
+    fn creating_over_something_that_exists_is_refused_not_truncated() {
+        let (_root, src, _dst) = workspace();
+        std::fs::write(src.join("taken.txt"), b"important").unwrap();
+
+        let outcome = run(
+            Job::Create {
+                path: src.join("taken.txt"),
+                directory: false,
+            },
+            never_conflicts,
+        );
+
+        assert!(!outcome.is_clean());
+        assert!(outcome.created.is_empty());
+        assert_eq!(std::fs::read(src.join("taken.txt")).unwrap(), b"important");
+    }
+
+    #[test]
+    fn duplicating_uses_a_standing_answer_rather_than_asking() {
+        let (_root, src, _dst) = workspace();
+        std::fs::write(src.join("a.txt"), b"x").unwrap();
+
+        let outcome = run(
+            Job::Transfer {
+                kind: Kind::Copy,
+                sources: vec![src.join("a.txt")],
+                destination: src.clone(),
+                follow_symlinks: false,
+                blanket: Some(Action::KeepBoth),
+            },
+            never_conflicts,
+        );
+
+        assert!(outcome.is_clean(), "{:?}", outcome.errors);
+        assert_eq!(std::fs::read(src.join("a (copy).txt")).unwrap(), b"x");
+        assert!(src.join("a.txt").exists());
     }
 
     #[test]
@@ -1611,12 +1833,14 @@ mod tests {
                 sources: Vec::new(),
                 destination: PathBuf::new(),
                 follow_symlinks: false,
+                blanket: None,
             },
             Job::Transfer {
                 kind: Kind::Move,
                 sources: Vec::new(),
                 destination: PathBuf::new(),
                 follow_symlinks: false,
+                blanket: Some(Action::KeepBoth),
             },
             Job::Trash(Vec::new()),
             Job::Delete(Vec::new()),

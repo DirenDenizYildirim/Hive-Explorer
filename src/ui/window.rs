@@ -11,25 +11,32 @@ use crate::fs::open;
 use crate::model::History;
 use crate::model::filter::FilterSpec;
 use crate::model::sort::SortSpec;
+use crate::model::undo;
 use crate::theme::{Registry, StyleOptions, ThemeProvider};
 use crate::ui::breadcrumb::Breadcrumb;
+use crate::ui::clipboard::FileClipboard;
+use crate::ui::context_menu;
 use crate::ui::debounce::Debouncer;
+use crate::ui::dialogs;
 use crate::ui::file_pane::FilePane;
 use crate::ui::keys;
 use crate::ui::path_entry::PathEntry;
 use crate::ui::sidebar::Sidebar;
 use crate::ui::status_bar::StatusBar;
 
+/// A menu or accelerator handler, of which there are enough to want a name.
+type WindowAction = Box<dyn Fn(&Rc<Window>)>;
+
 pub struct Window {
-    window: adw::ApplicationWindow,
-    file_pane: Rc<FilePane>,
+    pub(crate) window: adw::ApplicationWindow,
+    pub(crate) file_pane: Rc<FilePane>,
     sidebar: Rc<Sidebar>,
     breadcrumb: Rc<Breadcrumb>,
     status: Rc<StatusBar>,
     banner: adw::Banner,
     toasts: adw::ToastOverlay,
     split: adw::OverlaySplitView,
-    config: Rc<RefCell<Config>>,
+    pub(crate) config: Rc<RefCell<Config>>,
     registry: Rc<Registry>,
     theme: ThemeProvider,
     status_debouncer: RefCell<Option<Debouncer>>,
@@ -43,6 +50,13 @@ pub struct Window {
     back_button: gtk::Button,
     forward_button: gtk::Button,
     up_button: gtk::Button,
+    /// Inverses for everything destructive, bounded and in-session only.
+    pub(crate) undo: RefCell<undo::Stack>,
+    pub(crate) clipboard: Rc<FileClipboard>,
+    /// One operation at a time; queueing is out of scope for v1.
+    pub(crate) busy: std::cell::Cell<bool>,
+    pub(crate) undo_action: gio::SimpleAction,
+    last_toast: RefCell<Option<adw::Toast>>,
 }
 
 impl Window {
@@ -144,6 +158,10 @@ impl Window {
         breakpoint.add_setter(&split, "collapsed", Some(&true.to_value()));
         window.add_breakpoint(breakpoint);
 
+        let clipboard = FileClipboard::for_widget(&window);
+        let undo_action = gio::SimpleAction::new("undo", None);
+        undo_action.set_enabled(false);
+
         let this = Rc::new(Self {
             window,
             file_pane,
@@ -166,6 +184,11 @@ impl Window {
             back_button,
             forward_button,
             up_button,
+            undo: RefCell::new(undo::Stack::new()),
+            clipboard,
+            busy: std::cell::Cell::new(false),
+            undo_action,
+            last_toast: RefCell::new(None),
         });
 
         this.build_header(&header);
@@ -174,6 +197,9 @@ impl Window {
         this.wire_path_entry();
         this.wire_status();
         this.install_actions(app);
+        this.install_operation_actions(app);
+        this.wire_close_request();
+        context_menu::install(&this);
         this.apply_theme();
 
         this
@@ -185,6 +211,9 @@ impl Window {
 
     pub fn present(&self) {
         self.window.present();
+        // Focus only takes during construction once the window is realized, so
+        // the first listing gets the keyboard here rather than in `navigate`.
+        self.file_pane.focus_view();
     }
 
     fn build_header(self: &Rc<Self>, header: &adw::HeaderBar) {
@@ -200,6 +229,17 @@ impl Window {
         header.pack_start(&toggle_sidebar);
 
         let menu = gio::Menu::new();
+
+        let create_section = gio::Menu::new();
+        create_section.append(Some("New Folder…"), Some("win.new-folder"));
+        create_section.append(Some("New File…"), Some("win.new-file"));
+        menu.append_section(None, &create_section);
+
+        let edit_section = gio::Menu::new();
+        edit_section.append(Some("Undo"), Some("win.undo"));
+        edit_section.append(Some("Paste"), Some("win.paste"));
+        menu.append_section(None, &edit_section);
+
         let view_section = gio::Menu::new();
         view_section.append(Some("Show Hidden Files"), Some("win.toggle-hidden"));
         view_section.append(Some("Grid View"), Some("win.toggle-view"));
@@ -332,6 +372,13 @@ impl Window {
 
         if let Some(debouncer) = self.status_debouncer.borrow().as_ref() {
             debouncer.flush();
+        }
+
+        // Arriving somewhere should leave the keyboard in the list. Without
+        // this, focus stays wherever it was — a sidebar row, a breadcrumb
+        // button — and arrows and type-ahead do nothing until you click.
+        if self.title_stack.visible_child_name().as_deref() != Some("entry") {
+            self.file_pane.focus_view();
         }
     }
 
@@ -476,6 +523,16 @@ impl Window {
     }
 
     fn wire_path_entry(self: &Rc<Self>) {
+        // Coming back from the entry resets the breadcrumb's scroll position,
+        // which would otherwise hide the directory the user is actually in.
+        let breadcrumb = Rc::clone(&self.breadcrumb);
+        self.title_stack
+            .connect_visible_child_name_notify(move |stack| {
+                if stack.visible_child_name().as_deref() == Some("breadcrumb") {
+                    breadcrumb.scroll_to_current();
+                }
+            });
+
         let this = Rc::clone(self);
         self.path_entry.connect_activate(move |path| {
             this.title_stack.set_visible_child_name("breadcrumb");
@@ -530,20 +587,10 @@ impl Window {
             || error.matches(gio::IOErrorEnum::HostNotFound);
 
         if vanished {
-            let where_it_was = self
-                .file_pane
-                .location()
-                .and_then(|file| file.path())
-                .map(|path| crate::model::path::display_name(&path))
-                .unwrap_or_else(|| "That location".to_owned());
-
-            self.show_banner(&format!(
-                "{where_it_was} is no longer available — showing Home"
-            ));
-            self.navigate_home();
-            self.show_banner(&format!(
-                "{where_it_was} is no longer available — showing Home"
-            ));
+            // §10.1 hazard 8: renaming or deleting the folder being viewed must
+            // land somewhere real, and the nearest surviving parent is closer to
+            // where the user was than Home is.
+            self.ensure_location_exists();
             return;
         }
 
@@ -560,8 +607,18 @@ impl Window {
         self.banner.set_revealed(true);
     }
 
+    /// Show a transient status message.
+    ///
+    /// The previous one is dismissed first: these report what just happened, and
+    /// a queue would leave the newest result hidden behind stale ones for as
+    /// long as it takes them to time out.
     pub fn show_toast(&self, message: &str) {
-        self.toasts.add_toast(adw::Toast::new(message));
+        if let Some(previous) = self.last_toast.borrow_mut().take() {
+            previous.dismiss();
+        }
+        let toast = adw::Toast::new(message);
+        self.toasts.add_toast(toast.clone());
+        *self.last_toast.borrow_mut() = Some(toast);
     }
 
     fn wire_status(self: &Rc<Self>) {
@@ -654,8 +711,153 @@ impl Window {
         app.set_accels_for_action("win.go-up", &["<Alt>Up"]);
         app.set_accels_for_action("win.go-home", &["<Alt>Home"]);
         app.set_accels_for_action("win.open-path", &["<Control>l"]);
-        app.set_accels_for_action("win.select-all", &["<Control>a"]);
         app.set_accels_for_action("win.find", &["<Control>f"]);
+    }
+
+    /// Actions for everything in §8's operation list, plus their accelerators.
+    fn install_operation_actions(self: &Rc<Self>, app: &adw::Application) {
+        let operations: [(&str, WindowAction); 11] = [
+            ("copy", Box::new(|w: &Rc<Window>| w.copy_selection())),
+            ("cut", Box::new(|w: &Rc<Window>| w.cut_selection())),
+            ("paste", Box::new(|w: &Rc<Window>| w.paste())),
+            (
+                "duplicate",
+                Box::new(|w: &Rc<Window>| w.duplicate_selection()),
+            ),
+            ("rename", Box::new(|w: &Rc<Window>| w.rename_selection())),
+            ("trash", Box::new(|w: &Rc<Window>| w.trash_selection())),
+            ("delete", Box::new(|w: &Rc<Window>| w.delete_selection())),
+            ("new-folder", Box::new(|w: &Rc<Window>| w.new_folder())),
+            ("new-file", Box::new(|w: &Rc<Window>| w.new_file())),
+            (
+                "activate-selection",
+                Box::new(|w: &Rc<Window>| w.activate_selection()),
+            ),
+            (
+                "empty-trash-hint",
+                Box::new(|w: &Rc<Window>| w.show_trash_hint()),
+            ),
+        ];
+
+        for (name, handler) in operations {
+            let action = gio::SimpleAction::new(name, None);
+            let this = Rc::clone(self);
+            action.connect_activate(move |_, _| handler(&this));
+            self.window.add_action(&action);
+        }
+
+        let this = Rc::clone(self);
+        self.undo_action.connect_activate(move |_, _| this.undo());
+        self.window.add_action(&self.undo_action);
+
+        let open_with = gio::SimpleAction::new("open-with", Some(glib::VariantTy::STRING));
+        let this = Rc::clone(self);
+        open_with.connect_activate(move |_, parameter| {
+            if let Some(id) = parameter.and_then(glib::Variant::str) {
+                this.open_selection_with(id);
+            }
+        });
+        self.window.add_action(&open_with);
+
+        // New Folder means nothing to a text entry, so it can stay global.
+        app.set_accels_for_action("win.new-folder", &["<Control><Shift>n"]);
+        self.install_pane_shortcuts();
+    }
+
+    /// Shortcuts that a text entry must be able to take first.
+    ///
+    /// These cannot be application accelerators: those run above the focused
+    /// widget, so `Delete` in the rename dialog would trash the selection
+    /// instead of deleting a character, and Ctrl+A in the path entry would
+    /// select every file rather than the text. A shortcut controller on the
+    /// window in the bubble phase inverts that — the focused widget gets first
+    /// refusal, and anything it does not want reaches the file actions. They
+    /// still work with focus on the sidebar or a header button, which a
+    /// controller scoped to the views would not.
+    fn install_pane_shortcuts(self: &Rc<Self>) {
+        const SHORTCUTS: [(&str, &str); 12] = [
+            ("<Control>c", "win.copy"),
+            ("<Control>x", "win.cut"),
+            ("<Control>v", "win.paste"),
+            ("<Control>d", "win.duplicate"),
+            ("<Control>z", "win.undo"),
+            ("<Control>a", "win.select-all"),
+            ("F2", "win.rename"),
+            // Keypad first: GTK shows the last-registered accelerator in
+            // menus, and "Delete" reads better there than "Delete (keypad)".
+            ("KP_Delete", "win.trash"),
+            ("Delete", "win.trash"),
+            ("<Shift>Delete", "win.delete"),
+            ("Menu", "win.context-menu"),
+            ("<Shift>F10", "win.context-menu"),
+        ];
+
+        let controller = gtk::ShortcutController::new();
+        controller.set_scope(gtk::ShortcutScope::Local);
+        controller.set_propagation_phase(gtk::PropagationPhase::Bubble);
+
+        for (accelerator, action) in SHORTCUTS {
+            let Some(trigger) = gtk::ShortcutTrigger::parse_string(accelerator) else {
+                tracing::warn!(accelerator, "unparseable shortcut; skipping");
+                continue;
+            };
+            controller.add_shortcut(gtk::Shortcut::new(
+                Some(trigger),
+                Some(gtk::NamedAction::new(action)),
+            ));
+        }
+
+        self.window.add_controller(controller);
+    }
+
+    /// Launch the selection with a specific application, from "Open With".
+    fn open_selection_with(self: &Rc<Self>, desktop_id: &str) {
+        let Some(app) = gio::DesktopAppInfo::new(desktop_id) else {
+            self.show_toast("That application is no longer installed");
+            return;
+        };
+
+        let context = gtk::prelude::WidgetExt::display(&self.window).app_launch_context();
+        for path in self.file_pane.selected_paths() {
+            let file = gio::File::for_path(&path);
+            if let Err(error) = open::open_with(&file, app.upcast_ref(), Some(&context)) {
+                tracing::warn!(%error, path = %path.display(), "open with failed");
+                self.show_toast(&format!("Could not open: {error}"));
+            }
+        }
+    }
+
+    fn show_trash_hint(self: &Rc<Self>) {
+        self.show_toast("Emptying the Trash is not part of Hive; use your Trash folder");
+    }
+
+    /// §10.1 hazard 2: warn before the clipboard dies with the process.
+    fn wire_close_request(self: &Rc<Self>) {
+        let this = Rc::clone(self);
+        self.window.connect_close_request(move |window| {
+            if !this.config.borrow().behavior.warn_clipboard_on_quit {
+                return glib::Propagation::Proceed;
+            }
+            if !this.clipboard.owns_files() {
+                return glib::Propagation::Proceed;
+            }
+
+            let Some(what) = this.clipboard.describe_owned() else {
+                return glib::Propagation::Proceed;
+            };
+
+            let window = window.clone();
+            let this = Rc::clone(&this);
+            glib::spawn_future_local(async move {
+                if dialogs::confirm_quit_with_clipboard(&window, &what).await {
+                    // Cleared first so the handler lets the second attempt past.
+                    this.clipboard.forget();
+                    window.close();
+                }
+            });
+
+            glib::Propagation::Stop
+        });
     }
 
     fn show_about(&self) {
