@@ -431,6 +431,7 @@ impl Window {
         }
 
         self.ensure_location_exists();
+        self.refresh_free_space();
 
         // Removing the focused row drops focus out of the view entirely, which
         // would leave every keyboard shortcut dead until the user clicked.

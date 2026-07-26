@@ -14,8 +14,10 @@ pub mod operations;
 pub mod path_entry;
 pub mod preferences;
 pub mod progress;
+pub mod properties;
 pub mod sidebar;
 pub mod status_bar;
+pub mod thumbnails;
 pub mod window;
 
 pub use window::Window;

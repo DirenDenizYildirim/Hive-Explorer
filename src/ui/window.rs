@@ -23,8 +23,10 @@ use crate::ui::file_pane::FilePane;
 use crate::ui::keys;
 use crate::ui::path_entry::PathEntry;
 use crate::ui::preferences;
+use crate::ui::properties;
 use crate::ui::sidebar::Sidebar;
 use crate::ui::status_bar::StatusBar;
+use crate::ui::thumbnails::Thumbnailer;
 
 /// A menu or accelerator handler, of which there are enough to want a name.
 type WindowAction = Box<dyn Fn(&Rc<Window>)>;
@@ -74,7 +76,7 @@ impl Window {
         colors: Rc<RefCell<colors::Store>>,
         theme: ThemeProvider,
     ) -> Rc<Self> {
-        let (filter_spec, sort_spec, view_mode) = {
+        let (filter_spec, sort_spec, view_mode, thumbnail_limits) = {
             let config = config.borrow();
             (
                 FilterSpec::new(config.view.show_hidden, ""),
@@ -84,10 +86,12 @@ impl Window {
                     config.view.folders_first,
                 ),
                 config.view.mode,
+                config.thumbnails,
             )
         };
 
-        let file_pane = FilePane::new(filter_spec, sort_spec, Rc::clone(&colors));
+        let thumbnails = Thumbnailer::new(crate::paths::thumbnail_cache_dir(), thumbnail_limits);
+        let file_pane = FilePane::new(filter_spec, sort_spec, Rc::clone(&colors), thumbnails);
         file_pane.set_view_mode(view_mode);
 
         let sidebar = Sidebar::new(Rc::clone(&config), Rc::clone(&colors));
@@ -215,6 +219,8 @@ impl Window {
         this.wire_search();
         this.wire_path_entry();
         this.wire_status();
+        this.wire_thumbnails();
+        this.wire_animations();
         this.install_actions(app);
         this.install_operation_actions(app);
         this.wire_close_request();
@@ -273,6 +279,7 @@ impl Window {
         let view_section = gio::Menu::new();
         view_section.append(Some("Show Hidden Files"), Some("win.toggle-hidden"));
         view_section.append(Some("Grid View"), Some("win.toggle-view"));
+        view_section.append(Some("Properties"), Some("win.properties"));
         menu.append_section(None, &view_section);
 
         // The flavor switcher lives here as well as in the dialog: switching is
@@ -643,6 +650,17 @@ impl Window {
         self.show_banner(&message);
     }
 
+    /// Re-read the free space shown in the status line.
+    ///
+    /// Navigating asks once; a copy or a delete is the other thing that makes
+    /// the number wrong, and a stale "241 GiB free" after emptying a folder is
+    /// exactly the reading someone would act on.
+    pub(crate) fn refresh_free_space(&self) {
+        if let Some(location) = self.file_pane.location() {
+            self.status.update_free_space_for(&location);
+        }
+    }
+
     pub fn show_banner(&self, message: &str) {
         self.banner.set_title(message);
         self.banner.set_revealed(true);
@@ -677,6 +695,50 @@ impl Window {
 
         self.file_pane
             .connect_items_changed(move || debouncer.trigger());
+    }
+
+    /// Repaint rows as thumbnails arrive.
+    ///
+    /// Coalesced on the same 150 ms window as the status line: a directory of
+    /// photographs finishes decoding a few at a time, and one pass over the
+    /// visible rows picks up everything that landed in between.
+    fn wire_thumbnails(self: &Rc<Self>) {
+        let pane = Rc::clone(&self.file_pane);
+        let debouncer = Debouncer::new(defaults::DEBOUNCE_MS, move || pane.refresh_thumbnails());
+        self.file_pane
+            .thumbnails()
+            .connect_ready(move || debouncer.trigger());
+    }
+
+    /// Follow `gtk-enable-animations`, including when it changes mid-session.
+    ///
+    /// The setting reaches the stylesheet through `apply_theme`, which zeroes
+    /// every duration, and the widget-side animations through the pane. Reading
+    /// it once at startup would leave a user who turns animations off still
+    /// watching them until the next launch.
+    fn wire_animations(self: &Rc<Self>) {
+        let settings = gtk::Settings::for_display(&WidgetExt::display(&self.window));
+        self.file_pane
+            .set_animations(settings.is_gtk_enable_animations());
+
+        let this = Rc::clone(self);
+        settings.connect_gtk_enable_animations_notify(move |settings| {
+            let enabled = settings.is_gtk_enable_animations();
+            tracing::debug!(enabled, "animation setting changed");
+            this.file_pane.set_animations(enabled);
+            this.apply_theme();
+        });
+    }
+
+    /// Properties for the selection, or for the folder being viewed.
+    fn show_properties(self: &Rc<Self>) {
+        let mut paths = self.file_pane.selected_paths();
+        if paths.is_empty()
+            && let Some(current) = self.file_pane.location().and_then(|file| file.path())
+        {
+            paths.push(current);
+        }
+        properties::present(self, paths);
     }
 
     fn install_actions(self: &Rc<Self>, app: &adw::Application) {
@@ -749,6 +811,7 @@ impl Window {
                     w.search_entry.grab_focus();
                 }),
             ),
+            ("properties", Box::new(|w: &Rc<Window>| w.show_properties())),
         ];
 
         for (name, handler) in simple {
@@ -833,7 +896,7 @@ impl Window {
     /// still work with focus on the sidebar or a header button, which a
     /// controller scoped to the views would not.
     fn install_pane_shortcuts(self: &Rc<Self>) {
-        const SHORTCUTS: [(&str, &str); 12] = [
+        const SHORTCUTS: [(&str, &str); 14] = [
             ("<Control>c", "win.copy"),
             ("<Control>x", "win.cut"),
             ("<Control>v", "win.paste"),
@@ -848,6 +911,10 @@ impl Window {
             ("<Shift>Delete", "win.delete"),
             ("Menu", "win.context-menu"),
             ("<Shift>F10", "win.context-menu"),
+            // Both conventions, since file managers disagree about which one
+            // opens Properties and muscle memory does not read release notes.
+            ("<Control>i", "win.properties"),
+            ("<Alt>Return", "win.properties"),
         ];
 
         let controller = gtk::ShortcutController::new();

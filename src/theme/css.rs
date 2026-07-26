@@ -3,6 +3,9 @@
 use std::fmt::Write as _;
 
 use super::palette::{Accent, Color, Palette};
+// Short transition, per the 120–180 ms budget. Nothing bouncy, and the same
+// number the widget-side animations use, so nothing drifts out of step.
+use crate::config::defaults::TRANSITION_MS;
 
 /// Presentation choices that are not part of the palette itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,9 +30,6 @@ impl Default for StyleOptions {
         }
     }
 }
-
-/// Short transition, per the 120–180 ms budget. Nothing bouncy.
-const TRANSITION_MS: u32 = 150;
 
 /// Generate the complete stylesheet for `palette` under `options`.
 pub fn generate(palette: &Palette, options: &StyleOptions) -> String {
@@ -206,6 +206,12 @@ headerbar menubutton > button image {{
   color: {text};
 }}
 
+headerbar button {{
+  transition:
+    background-color {duration}ms ease-out,
+    color {duration}ms ease-out;
+}}
+
 headerbar button:disabled,
 headerbar button:disabled image {{
   color: {overlay0};
@@ -226,6 +232,7 @@ popover > arrow {{
         mantle = n.mantle.to_hex(),
         surface0 = n.surface0.to_hex(),
         overlay0 = n.overlay0.to_hex(),
+        duration = duration,
     );
 
     if !options.client_side_rounding || !options.client_side_shadow {
@@ -362,7 +369,9 @@ popover > arrow {{
   padding: 2px 4px;
   min-height: 30px;
   border-radius: 6px;
-  transition: background-color {duration}ms ease-out;
+  transition:
+    background-color {duration}ms ease-out,
+    color {duration}ms ease-out;
 }}
 
 .hive-file-pane row:hover {{
@@ -433,6 +442,17 @@ popover > arrow {{
 .hive-folder-icon {{
   color: {subtext1};
 }}
+
+/* An image thumbnail standing in for the symbolic icon. Just enough rounding
+   that a photo does not butt hard against the row, and no border: a frame
+   around every picture is the kind of chrome §4 asks us not to draw. */
+.hive-thumbnail {{
+  border-radius: 3px;
+}}
+
+.hive-file-pane gridview .hive-thumbnail {{
+  border-radius: 5px;
+}}
 ",
         base = n.base.to_hex(),
         mantle = n.mantle.to_hex(),
@@ -473,6 +493,7 @@ popover > arrow {{
   box-shadow: none;
   border: 2px solid transparent;
   outline: none;
+  transition: border-color {duration}ms ease-out;
 }}
 
 .hive-swatch:hover {{
@@ -489,6 +510,7 @@ popover > arrow {{
 ",
         overlay1 = n.overlay1.to_hex(),
         text = n.text.to_hex(),
+        duration = duration,
     );
 
     for slot in Accent::ALL {

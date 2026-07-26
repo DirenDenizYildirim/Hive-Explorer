@@ -10,6 +10,7 @@ pub mod path;
 pub mod pins;
 pub mod preflight;
 pub mod sort;
+pub mod thumbnail;
 pub mod trashinfo;
 pub mod undo;
 pub mod uri;

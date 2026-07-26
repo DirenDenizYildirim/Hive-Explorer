@@ -13,6 +13,7 @@ use crate::model::filter::{self, FilterInput, FilterSpec};
 use crate::model::sort::{self, SortKeyData, SortSpec};
 use crate::theme::palette::Accent;
 use crate::ui::dnd::FolderDrag;
+use crate::ui::thumbnails::Thumbnailer;
 
 /// Attributes requested from every entry.
 const ATTRIBUTES: &str = concat!(
@@ -28,6 +29,16 @@ const ATTRIBUTES: &str = concat!(
     "standard::content-type,",
     "time::modified",
 );
+
+/// Icon edge in the list view. Small enough that a thumbnail here is a hint
+/// rather than a picture, which is what a list is for.
+const ICON_SIZE_LIST: i32 = 16;
+
+/// Icon edge in the grid view. Large enough for a thumbnail to be worth having.
+const ICON_SIZE_GRID: i32 = 64;
+
+/// Grid cell width. Wider than the icon so two-line names have somewhere to go.
+const CELL_WIDTH: i32 = 112;
 
 /// Mutable view state read by the filter and sorter shims.
 #[derive(Debug, Clone, Default)]
@@ -82,11 +93,17 @@ pub struct FilePane {
     /// bubble phase and leaves its position here for the view gesture to take.
     right_clicked: Rc<Cell<Option<u32>>>,
     colors: Colors,
+    thumbnails: Rc<Thumbnailer>,
     rows: LiveRows,
 }
 
 impl FilePane {
-    pub fn new(filter_spec: FilterSpec, sort_spec: SortSpec, colors: Colors) -> Rc<Self> {
+    pub fn new(
+        filter_spec: FilterSpec,
+        sort_spec: SortSpec,
+        colors: Colors,
+        thumbnails: Rc<Thumbnailer>,
+    ) -> Rc<Self> {
         let state = Rc::new(RefCell::new(ViewState {
             filter: filter_spec,
             sort: sort_spec,
@@ -156,11 +173,28 @@ impl FilePane {
 
         let right_clicked = Rc::new(Cell::new(None));
         let rows: LiveRows = Rc::new(RefCell::new(Vec::new()));
-        let column_view = build_column_view(&selection, &right_clicked, &colors, &rows);
-        let grid_view = build_grid_view(&selection, &right_clicked, &colors, &rows);
+        let column_view = build_column_view(
+            &selection,
+            &right_clicked,
+            &colors,
+            &thumbnails,
+            &rows,
+            ICON_SIZE_LIST,
+        );
+        let grid_view = build_grid_view(
+            &selection,
+            &right_clicked,
+            &colors,
+            &thumbnails,
+            &rows,
+            ICON_SIZE_GRID,
+        );
 
         let stack = gtk::Stack::new();
         stack.set_transition_type(gtk::StackTransitionType::None);
+        // Within the 120–180 ms budget; whether it runs at all is decided by
+        // `set_animations`, which follows `gtk-enable-animations`.
+        stack.set_transition_duration(crate::config::defaults::TRANSITION_MS);
         stack.add_named(&scrolled(&column_view), Some(ViewMode::List.id()));
         stack.add_named(&scrolled(&grid_view), Some(ViewMode::Grid.id()));
 
@@ -168,7 +202,7 @@ impl FilePane {
         container.append(&stack);
         container.add_css_class("hive-file-pane");
 
-        Rc::new(Self {
+        let this = Rc::new(Self {
             container,
             stack,
             directory_list,
@@ -184,8 +218,25 @@ impl FilePane {
             mode: Cell::new(ViewMode::List),
             right_clicked,
             colors,
+            thumbnails,
             rows,
-        })
+        });
+
+        // A directory bigger than the configured cap gets no thumbnails at all.
+        // The count is watched rather than read once, because `DirectoryList`
+        // fills in progressively: a folder of 50,000 files reports 200 entries a
+        // moment after it is opened.
+        let watcher = Rc::downgrade(&this);
+        this.directory_list
+            .connect_items_changed(move |list, _, _, _| {
+                if let Some(pane) = watcher.upgrade()
+                    && pane.thumbnails.observe_directory(list.n_items() as usize)
+                {
+                    pane.refresh_thumbnails();
+                }
+            });
+
+        this
     }
 
     pub fn widget(&self) -> &gtk::Box {
@@ -224,7 +275,22 @@ impl FilePane {
 
     /// Point the pane at a new location.
     pub fn set_location(&self, file: &gio::File) {
+        // Whatever was still queued belongs to the folder being left.
+        self.thumbnails.reset();
         self.directory_list.set_file(Some(file));
+    }
+
+    pub fn thumbnails(&self) -> &Rc<Thumbnailer> {
+        &self.thumbnails
+    }
+
+    /// Fade the list and grid in or out of animating, per `gtk-enable-animations`.
+    pub fn set_animations(&self, animations: bool) {
+        self.stack.set_transition_type(if animations {
+            gtk::StackTransitionType::Crossfade
+        } else {
+            gtk::StackTransitionType::None
+        });
     }
 
     pub fn location(&self) -> Option<gio::File> {
@@ -393,16 +459,32 @@ impl FilePane {
 
     /// Repaint the folder icons of every row currently on screen.
     ///
-    /// Called after a colour changes. Dead weak references are dropped on the
-    /// way past, so a session that scrolls through a great many rows does not
-    /// accumulate them.
+    /// Called after a colour changes.
     pub fn refresh_folder_colors(&self) {
+        let colors = Rc::clone(&self.colors);
+        self.restyle_rows(move |item| apply_folder_color(item, &colors));
+    }
+
+    /// Show thumbnails that have arrived since the rows were bound.
+    ///
+    /// Coalesced by the caller: a directory of images finishes decoding a few
+    /// at a time, and one walk of the visible rows covers all of them.
+    pub fn refresh_thumbnails(&self) {
+        let thumbnails = Rc::clone(&self.thumbnails);
+        self.restyle_rows(move |item| apply_thumbnail(item, &thumbnails));
+    }
+
+    /// Run `restyle` over every row that currently has a widget.
+    ///
+    /// Dead weak references are dropped on the way past, so a session that
+    /// scrolls through a great many rows does not accumulate them.
+    fn restyle_rows(&self, restyle: impl Fn(&gtk::ListItem)) {
         let Ok(mut rows) = self.rows.try_borrow_mut() else {
             return;
         };
         rows.retain(|weak| match weak.upgrade() {
             Some(item) => {
-                apply_folder_color(&item, &self.colors);
+                restyle(&item);
                 true
             }
             None => false,
@@ -609,6 +691,54 @@ fn apply_folder_color(item: &gtk::ListItem, colors: &Colors) {
     }
 }
 
+/// Show a thumbnail on a row, if one already exists for that file.
+///
+/// Never decodes and never touches the disk: a miss queues the work and leaves
+/// the symbolic icon in place, and the row is repainted later when the picture
+/// arrives. Rows are recycled, so a row that had a thumbnail a moment ago must
+/// have it taken away again — which the icon-setting half of bind does by
+/// replacing the paintable outright.
+fn apply_thumbnail(item: &gtk::ListItem, thumbnails: &Rc<Thumbnailer>) {
+    let Some(icon) = icon_of(item) else {
+        return;
+    };
+    let Some(info) = item.item().and_then(|o| o.downcast::<gio::FileInfo>().ok()) else {
+        return;
+    };
+    if is_directory(&info) {
+        return;
+    }
+    let Some(path) = file_of(&info).and_then(|file| file.path()) else {
+        return;
+    };
+
+    let texture = thumbnails.lookup(
+        &path,
+        modified_seconds(&info),
+        info.size().max(0) as u64,
+        &content_type(&info),
+    );
+
+    if let Some(texture) = texture {
+        icon.set_paintable(Some(&texture));
+        icon.add_css_class("hive-thumbnail");
+    }
+}
+
+/// Put the symbolic icon back, undoing any thumbnail from a previous binding.
+fn apply_icon(icon: &gtk::Image, info: &gio::FileInfo) {
+    icon.remove_css_class("hive-thumbnail");
+    match info.symbolic_icon() {
+        Some(gicon) => icon.set_from_gicon(&gicon),
+        None => icon.set_icon_name(Some(fallback_icon(info))),
+    }
+    if is_directory(info) {
+        icon.add_css_class("hive-folder-icon");
+    } else {
+        icon.remove_css_class("hive-folder-icon");
+    }
+}
+
 /// Let a folder be dragged onto the sidebar to pin it.
 ///
 /// Only folders start a drag, and the payload is Hive's own boxed type, so a
@@ -711,7 +841,9 @@ fn build_column_view(
     selection: &gtk::MultiSelection,
     right_clicked: &Rc<Cell<Option<u32>>>,
     colors: &Colors,
+    thumbnails: &Rc<Thumbnailer>,
     rows: &LiveRows,
+    icon_size: i32,
 ) -> gtk::ColumnView {
     let view = gtk::ColumnView::builder()
         .model(selection)
@@ -723,7 +855,14 @@ fn build_column_view(
         .build();
 
     view.set_enable_rubberband(true);
-    view.append_column(&name_column(selection, right_clicked, colors, rows));
+    view.append_column(&name_column(
+        selection,
+        right_clicked,
+        colors,
+        thumbnails,
+        rows,
+        icon_size,
+    ));
 
     let size_column = text_column("Size", |info| {
         if is_directory(info) {
@@ -766,7 +905,9 @@ fn name_column(
     selection: &gtk::MultiSelection,
     right_clicked: &Rc<Cell<Option<u32>>>,
     colors: &Colors,
+    thumbnails: &Rc<Thumbnailer>,
     rows: &LiveRows,
+    icon_size: i32,
 ) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
 
@@ -779,7 +920,7 @@ fn name_column(
         };
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         let icon = gtk::Image::new();
-        icon.set_pixel_size(16);
+        icon.set_pixel_size(icon_size);
         icon.add_css_class("hive-item-icon");
         let label = gtk::Label::builder()
             .xalign(0.0)
@@ -802,6 +943,7 @@ fn name_column(
     });
 
     let bind_colors = Rc::clone(colors);
+    let bind_thumbnails = Rc::clone(thumbnails);
     factory.connect_bind(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
@@ -815,15 +957,7 @@ fn name_column(
 
         let mut child = row.first_child();
         if let Some(icon) = child.clone().and_then(|c| c.downcast::<gtk::Image>().ok()) {
-            match info.symbolic_icon() {
-                Some(gicon) => icon.set_from_gicon(&gicon),
-                None => icon.set_icon_name(Some(fallback_icon(&info))),
-            }
-            if is_directory(&info) {
-                icon.add_css_class("hive-folder-icon");
-            } else {
-                icon.remove_css_class("hive-folder-icon");
-            }
+            apply_icon(&icon, &info);
         }
 
         child = child.and_then(|c| c.next_sibling());
@@ -840,6 +974,7 @@ fn name_column(
         }
 
         apply_folder_color(item, &bind_colors);
+        apply_thumbnail(item, &bind_thumbnails);
     });
 
     gtk::ColumnViewColumn::builder()
@@ -892,7 +1027,9 @@ fn build_grid_view(
     selection: &gtk::MultiSelection,
     right_clicked: &Rc<Cell<Option<u32>>>,
     colors: &Colors,
+    thumbnails: &Rc<Thumbnailer>,
     rows: &LiveRows,
+    icon_size: i32,
 ) -> gtk::GridView {
     let factory = gtk::SignalListItemFactory::new();
 
@@ -905,10 +1042,10 @@ fn build_grid_view(
         };
         let cell = gtk::Box::new(gtk::Orientation::Vertical, 6);
         cell.set_halign(gtk::Align::Center);
-        cell.set_width_request(96);
+        cell.set_width_request(CELL_WIDTH);
 
         let icon = gtk::Image::new();
-        icon.set_pixel_size(48);
+        icon.set_pixel_size(icon_size);
         icon.add_css_class("hive-item-icon");
 
         let label = gtk::Label::builder()
@@ -937,6 +1074,7 @@ fn build_grid_view(
     });
 
     let bind_colors = Rc::clone(colors);
+    let bind_thumbnails = Rc::clone(thumbnails);
     factory.connect_bind(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
@@ -950,15 +1088,7 @@ fn build_grid_view(
 
         let mut child = cell.first_child();
         if let Some(icon) = child.clone().and_then(|c| c.downcast::<gtk::Image>().ok()) {
-            match info.symbolic_icon() {
-                Some(gicon) => icon.set_from_gicon(&gicon),
-                None => icon.set_icon_name(Some(fallback_icon(&info))),
-            }
-            if is_directory(&info) {
-                icon.add_css_class("hive-folder-icon");
-            } else {
-                icon.remove_css_class("hive-folder-icon");
-            }
+            apply_icon(&icon, &info);
         }
 
         child = child.and_then(|c| c.next_sibling());
@@ -969,6 +1099,7 @@ fn build_grid_view(
         }
 
         apply_folder_color(item, &bind_colors);
+        apply_thumbnail(item, &bind_thumbnails);
     });
 
     gtk::GridView::builder()

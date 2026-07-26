@@ -41,6 +41,40 @@ pub fn selection_count(count: usize) -> String {
     }
 }
 
+/// A Unix mode as `rwxr-xr-x`, for the Properties dialog.
+///
+/// Only the permission bits; the file type is shown as its own row rather than
+/// as a leading character, since the dialog already says what the thing is.
+/// The special bits are rendered where `ls` puts them — an `s` or `t` in place
+/// of the execute bit, capitalised when the execute bit is not actually set,
+/// because "setuid but not executable" is worth being able to see.
+pub fn permissions(mode: u32) -> String {
+    let mut out = String::with_capacity(9);
+    let triples = [
+        (mode >> 6, mode & 0o4000, 's'),
+        (mode >> 3, mode & 0o2000, 's'),
+        (mode, mode & 0o1000, 't'),
+    ];
+
+    for (bits, special, marker) in triples {
+        out.push(if bits & 0o4 != 0 { 'r' } else { '-' });
+        out.push(if bits & 0o2 != 0 { 'w' } else { '-' });
+        out.push(match (bits & 0o1 != 0, special != 0) {
+            (true, false) => 'x',
+            (true, true) => marker,
+            (false, true) => marker.to_ascii_uppercase(),
+            (false, false) => '-',
+        });
+    }
+
+    out
+}
+
+/// The same mode as four octal digits, which is what `chmod` wants.
+pub fn permissions_octal(mode: u32) -> String {
+    format!("{:04o}", mode & 0o7777)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -73,6 +107,45 @@ mod tests {
         let out = human_bytes(u64::MAX);
         assert!(out.ends_with("PiB"), "{out}");
         assert!(human_bytes(u64::MAX / 2).ends_with("PiB"));
+    }
+
+    #[test]
+    fn permission_bits_read_like_ls() {
+        assert_eq!(permissions(0o755), "rwxr-xr-x");
+        assert_eq!(permissions(0o644), "rw-r--r--");
+        assert_eq!(permissions(0o600), "rw-------");
+        assert_eq!(permissions(0o777), "rwxrwxrwx");
+        assert_eq!(permissions(0o000), "---------");
+    }
+
+    #[test]
+    fn the_file_type_bits_are_ignored() {
+        // 0o100644 is a regular file; 0o40755 is a directory.
+        assert_eq!(permissions(0o100_644), "rw-r--r--");
+        assert_eq!(permissions(0o040_755), "rwxr-xr-x");
+        assert_eq!(permissions_octal(0o100_644), "0644");
+    }
+
+    #[test]
+    fn special_bits_show_where_ls_puts_them() {
+        assert_eq!(permissions(0o4755), "rwsr-xr-x", "setuid");
+        assert_eq!(permissions(0o2755), "rwxr-sr-x", "setgid");
+        assert_eq!(permissions(0o1777), "rwxrwxrwt", "sticky, as on /tmp");
+        assert_eq!(
+            permissions(0o4644),
+            "rwSr--r--",
+            "setuid without execute is capitalised"
+        );
+        assert_eq!(permissions(0o1666), "rw-rw-rwT");
+    }
+
+    #[test]
+    fn octal_keeps_four_digits_and_drops_the_type() {
+        assert_eq!(permissions_octal(0o755), "0755");
+        assert_eq!(permissions_octal(0o7), "0007");
+        assert_eq!(permissions_octal(0o4755), "4755");
+        assert_eq!(permissions_octal(0), "0000");
+        assert_eq!(permissions_octal(u32::MAX), "7777");
     }
 
     #[test]

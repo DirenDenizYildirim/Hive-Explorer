@@ -26,6 +26,14 @@ pub const THUMBNAIL_MAX_DIRECTORY_ENTRIES: usize = 2000;
 /// Coalescing window for view-derived UI and directory-monitor churn.
 pub const DEBOUNCE_MS: u32 = 150;
 
+/// Every animation in Hive, in milliseconds.
+///
+/// Inside the 120–180 ms budget, and one number rather than several so nothing
+/// can drift into feeling slower than the thing next to it. Whether an
+/// animation runs at all is `gtk-enable-animations`, which is honoured
+/// separately: this is the duration, not the decision.
+pub const TRANSITION_MS: u32 = 150;
+
 /// Sidebar collapses to an overlay below this window width.
 pub const SIDEBAR_BREAKPOINT_PX: i32 = 640;
 

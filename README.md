@@ -5,12 +5,11 @@ Minimal pastel explorer — a file manager for Hyprland, written in Rust with GT
 Priority order: **stability > visual polish > feature count.** A small set of operations that never fail is
 worth more than a wide feature set that occasionally corrupts or hangs.
 
-> **Status: milestones (a) through (e) of 6.** The window, sidebar, theming system, config layer,
-> non-blocking progressive listing, navigation, full keyboard support, the CLI, and the whole file-operation
-> layer — copy, move, rename, trash, delete, undo, with conflict handling and pre-flight checks — are in
-> place, as is the theming UI — flavor switcher, live swapping, accent setting and follow-system — and now
-> folder colors and sidebar pinning. Thumbnails and the properties dialog are not built yet.
-> See [Roadmap](#roadmap).
+> **Status: all six milestones, (a) through (f), are built.** The window, sidebar, theming system, config
+> layer, non-blocking progressive listing, navigation, full keyboard support, the CLI, the whole
+> file-operation layer — copy, move, rename, trash, delete, undo, with conflict handling and pre-flight
+> checks — the theming UI, folder colors, sidebar pinning, and now image thumbnails, the properties dialog
+> with opt-in recursive size, the status line and the animation pass. See [Roadmap](#roadmap).
 
 ---
 
@@ -132,6 +131,7 @@ File operations:
 | `Shift+Delete` | Delete permanently, behind a confirmation |
 | `Ctrl+Shift+N` | New folder |
 | `Ctrl+Z` | Undo |
+| `Ctrl+I` / `Alt+Enter` | Properties — of the selection, or of this folder when nothing is selected |
 
 Type-ahead is why `Ctrl+F` is an explicit shortcut rather than start-typing-to-search: bare typing jumps to a
 name, and only `Ctrl+F` opens the filter.
@@ -260,6 +260,16 @@ Three outcomes, and the last one is the common case on a bare Hyprland install:
 machine without a desktop portal backend. An explicit flavor always wins and always works: picking one from
 the menu turns follow-system off rather than being silently overridden, and startup never waits on the portal.
 
+### Animations
+
+Every transition Hive draws is **150 ms, ease-out, and nothing bouncy** — one duration for all of them, so
+nothing feels slower than the thing next to it. Row and sidebar hover, header buttons, breadcrumb segments,
+accent swatches, and the list ↔ grid crossfade all share it.
+
+All of it follows **`gtk-enable-animations`**, live: turn the setting off and the stylesheet is regenerated
+with every duration at zero and the view crossfade switched off, with no restart. Hive reads the setting
+through `gtk::Settings` rather than assuming an XSETTINGS daemon is present.
+
 ### A note on system GTK themes
 
 Hive's stylesheet loads one step above `GTK_STYLE_PROVIDER_PRIORITY_USER`, so it outranks a theme symlinked
@@ -375,6 +385,74 @@ empty space instead, exactly as in every other file manager.
 
 ---
 
+## Thumbnails
+
+Image files get a thumbnail in place of their symbolic icon, in both views — small in the list, 64 px in the
+grid. Nothing about it happens on the main thread: a row being drawn only ever looks in a hash map, and a
+miss queues work and leaves the icon alone until a picture exists.
+
+Three limits, all in `config.toml` under `[thumbnails]`:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Turn the whole thing off |
+| `max_pixels` | `256` | Longest edge of the cached image. Smaller images are never scaled up |
+| `max_file_bytes` | `33554432` | Skip source files over 32 MiB rather than decoding them |
+| `max_directory_entries` | `2000` | Above this many entries in one directory, stop thumbnailing entirely |
+
+At most four images decode at once, and the backlog is capped: scroll quickly through a thousand photographs
+and the ones you flew past are dropped rather than decoded for nobody. They are re-requested if you scroll
+back. The queue is emptied on navigating away, so a huge folder you have left cannot delay the one you are
+looking at.
+
+**Only images.** Whatever gdk-pixbuf can decode, which on a normal Arch install means PNG, JPEG, WebP, GIF,
+BMP, TIFF and — with `librsvg` present — SVG. Video thumbnails are out of scope for v1. A file that fails to
+decode is remembered as having no thumbnail and is not retried.
+
+Cached in `$XDG_CACHE_HOME/hive/thumbnails/`, one PNG per source path in a two-level fan-out directory. The
+cache is never pruned automatically: it holds one file per distinct image you have ever looked at, and
+re-thumbnailing an edited image *replaces* its entry rather than adding a second. Delete the directory to
+reclaim the space; it rebuilds itself.
+
+---
+
+## Status line
+
+One thin line along the bottom: how many items the folder holds, how many are selected, and how much space is
+free where you are standing. While a directory is still enumerating the count carries an ellipsis and a
+spinner; with a filter active it reads `12 of 2,102 items`.
+
+It is fed through a **150 ms coalescing window**, so a directory monitor reporting a thousand changes in a
+second redraws the line once rather than a thousand times. Free space is re-read when you navigate and again
+whenever a file operation finishes — a stale "241 GiB free" after emptying a folder is exactly the number
+someone would act on.
+
+---
+
+## Properties
+
+`Ctrl+I` or `Alt+Enter`, or **Properties** in the context menu. With nothing selected it describes the folder
+you are looking at. It shows the name, location, type and mime type, size, timestamps, permissions in both
+`rwxr-xr-x` and octal form, and owner and group. Select several things and it reports the count and offers a
+combined size instead.
+
+A symlink is described as the link, not as its target — with the target on its own **Links to** row.
+
+**A folder's size is never computed unless you ask.** The size row shows a **Calculate** button; pressing it
+starts a walk on its own thread that reports a running total as it counts, and the button becomes **Cancel**.
+Closing the dialog cancels it too. This is the one operation in a file manager most likely to freeze it, so
+it is opt-in, off-thread, cancellable at any point, and always shows how far it got:
+
+```
+Size    3.2 GiB (3382856318 bytes) in 56065 items — stopped        [Calculate]
+```
+
+Symlinks are counted but never followed, the same rule `du` uses — which is why a symlink loop is a
+non-event here. Hard links are counted once per name, so a tree of links to one large file reads larger than
+the space it occupies on disk.
+
+---
+
 ## Hyprland window rules
 
 ```conf
@@ -471,11 +549,11 @@ accident.
 
 | # | Hazard | Decision | Status |
 |---|---|---|---|
-| 1 | **Recursive folder size is an unbounded tree walk** | Never computed automatically. The Properties dialog shows size behind an explicit **Calculate** button, run off-thread, cancellable, updating incrementally. | milestone (f) |
+| 1 | **Recursive folder size is an unbounded tree walk** | Never computed automatically. The Properties dialog shows size behind an explicit **Calculate** button, run off-thread, cancellable at any point, updating incrementally, and reporting how far it got if you stop it. Closing the dialog cancels the walk. | done |
 | 2 | **Wayland clipboard dies with the process** | Copying a file and then closing Hive loses the clipboard, because Wayland clipboard content is owned by the client. Closing the window while Hive still owns a file clipboard asks first — **Don't Quit** / **Quit Anyway** — and names what would be lost. It asks *only* while Hive actually owns it: the moment another application takes the clipboard the warning stops. Set `warn_clipboard_on_quit = false` to turn it off, or run `wl-clip-persist`, which makes the whole problem moot. | done |
 | 3 | **Clipboard format interop** | Hive offers and accepts both `text/uri-list` and `x-special/gnome-copied-files`; the latter carries the cut-vs-copy distinction. A plain-text form rides along so pasting into a terminal gives the paths. A `text/uri-list` arriving from another application says nothing about intent and is read as a **copy** — treating an ambiguous paste as a move would delete that application's files. | done |
 | 4 | **Trash fails on removable drives** | FAT/exFAT cannot host the per-mount `.Trash-$uid` the freedesktop spec wants, and neither can `tmpfs`. `Delete` detects the failure and offers permanent delete through a clear dialog. It never silently does nothing, and never silently permanently deletes instead. | done |
-| 5 | **Thumbnail cache staleness** | The cache is keyed on **(path, mtime, size)**, not path alone, so an edited image does not show its old thumbnail forever. | milestone (f) |
+| 5 | **Thumbnail cache staleness** | Keyed on **(path, mtime, size)**, not path alone. The cache file is addressed by the path and carries the mtime and size it was made from as PNG text chunks; both must match or it is rewritten. Editing an image therefore replaces its thumbnail rather than showing the old one forever, and a same-second edit is still caught because the size changes too. | done |
 | 6 | **Case-only rename** (`foo` → `Foo`) | Detected and performed as a two-step rename through a hidden staging name in the same directory. Unconditional rather than conditional on detecting the filesystem, because that cannot be done reliably and the direct rename may *destroy* the file rather than merely fail. If the second step fails the staging name is renamed back. | done |
 | 7 | **Symlink copy semantics** | **Default: copy the link itself, not its target** (`NOFOLLOW_SYMLINKS`), so a broken link copies as a broken link rather than failing. Set `follow_symlinks_on_copy = true` under `[behavior]` to copy targets instead; there is no per-operation modifier, because a destructive default that changes with a held key is exactly the implicit behavior the spec rules out. | done |
 | 8 | **Self-referential operations** | Renaming or deleting the directory currently being viewed walks up to the **nearest surviving ancestor** rather than sitting on a dead path or jumping all the way Home. Cut-then-paste into the same directory is a no-op, not a duplicate and not a deletion. Copying or moving a folder into its own subtree, or onto itself, is refused before a single byte moves. | done |
@@ -495,6 +573,19 @@ Three more that folder colors and pinning brought with them:
 - **A pinned folder that no longer exists is dimmed, not removed.** The pinned list is yours; Hive does not
   edit it on your behalf. The row goes italic and grey with "not found" in its tooltip, and right-click →
   Unpin removes it when you decide to.
+
+Three more that thumbnails and the properties dialog brought with them:
+
+- **An image that will not decode is remembered as having no thumbnail.** A corrupt file, or a format with no
+  pixbuf loader installed, is tried once and then left with its symbolic icon. Retrying on every scroll would
+  turn one broken file into a permanent background load.
+- **The thumbnail cache is never pruned.** It holds one PNG per distinct image path you have looked at, and
+  re-thumbnailing replaces rather than adds. There is no expiry sweep, because a sweep is a tree walk over
+  your cache on a timer and this is a directory you can safely delete at any moment.
+- **The properties dialog waits for the filesystem before it appears.** It is built in one pass from one
+  `query_info`, which is what keeps every row present and the dialog sized correctly. Nothing blocks — the
+  query is async — but on a mount that has stopped answering the effect is that no dialog appears rather than
+  an empty one. The rest of Hive stays responsive throughout.
 
 Two more decisions that are already live in milestone (a):
 
@@ -517,17 +608,20 @@ src/
   model/     sort comparators, filter predicate, path normalization,
              the undo stack and its re-validation, copy/move pre-flight,
              clipboard payload formats, trashinfo parsing, the pinned
-             list and its reordering                                  — no GTK, unit-tested
+             list and its reordering, thumbnail eligibility and cache
+             addressing                                               — no GTK, unit-tested
   config/    versioned schema, atomic writes, malformed-file recovery  — no GTK, unit-tested
   colors/    the folder-color store: slot names by absolute path,
              lenient reads, lazy pruning                              — no GTK, unit-tested
   theme/     palette types, Catppuccin constants, CSS generator,
              follow-system resolution                                 — no GTK except provider.rs
   fs/        places resolution, volume relevance, the off-thread
-             operation worker, trashing and restoring                 — policy is plain Rust
+             operation worker, trashing and restoring, the cancellable
+             recursive size walk                                      — policy is plain Rust
   ui/        window, sidebar, breadcrumb, file pane, status bar,
              clipboard, dialogs, progress, context menu, the colour
-             picker and the pin drag payload                          — GTK layer, holds no policy
+             picker, the pin drag payload, the thumbnail worker pool
+             and the properties dialog                                — GTK layer, holds no policy
   app.rs     adw::Application, HANDLES_OPEN, startup
   cli.rs     argument parsing                                         — unit-tested
 ```
@@ -550,12 +644,20 @@ Decision rules live in `model/` as plain functions; the `CustomFilter` and `Cust
 read a `gio::FileInfo` into those functions' input types. That is what lets `cargo test` cover the rules that
 decide what you see without needing a display.
 
-**`std::fs` carve-out.** User-facing filesystem work goes through `gio`, so trash, mounts, URI handling, and
-monitoring match the rest of the desktop. Three modules are exempt and use `std::fs`: `config`, the
-folder-color store, and the read-only theme-registry scan. All three must stay GTK/gio-free to remain
-unit-testable without a display, and all three touch only Hive's own config area. `config` and `colors` share
-one write-then-rename helper (`config::atomic`) rather than each carrying its own copy — an atomic write is
-exactly the code that must not drift between two callers.
+**`std::fs` carve-out.** User-facing filesystem work goes through `gio`, so trash, mounts, URI handling, the
+thumbnail cache, and monitoring match the rest of the desktop. Three of Hive's own settings modules are
+exempt and use `std::fs`: `config`, the folder-color store, and the read-only theme-registry scan. All three
+must stay GTK/gio-free to remain unit-testable without a display, and all three touch only Hive's own config
+area. `config` and `colors` share one write-then-rename helper (`config::atomic`) rather than each carrying
+its own copy — an atomic write is exactly the code that must not drift between two callers.
+
+The two **worker-thread walks** are the other exception, and a larger one worth naming plainly: the transfer
+engine in `fs/ops.rs` and the recursive size walk in `fs/size.rs` both read metadata and list directories
+with `std::fs` rather than gio. Both run on their own thread, both need `symlink_metadata` semantics
+directly, and having two walks over the same trees disagree about how they read a directory would be worse
+than either choice. The gio-shaped work these operations depend on — trashing, free space, URIs, launching —
+still goes through gio. *If you would rather the whole engine spoke gio, that is a contained change to those
+two files and worth doing deliberately rather than by drift.*
 
 ---
 
@@ -584,7 +686,7 @@ files and directories. Python 3 stdlib only.
 
 ### Manual QA checklist
 
-Every item marked *(a)* through *(e)* is verifiable now; the rest arrive with their milestone.
+Every item here is verifiable now.
 
 **Listing and stability**
 
@@ -659,6 +761,39 @@ Every item marked *(a)* through *(e)* is verifiable now; the rest arrive with th
 - [ ] *(e)* Dragging a folder over another application refuses the drop — Hive's drags stay inside Hive.
 - [ ] *(e)* Rubber-band selection still works when started on empty space in the pane.
 
+**Thumbnails**
+
+- [ ] *(f)* A folder of photographs fills in thumbnails progressively, in both list and grid, without the
+      window ever going unresponsive.
+- [ ] *(f)* Scrolling fast through a large photo folder stays smooth, and thumbnails catch up behind you.
+- [ ] *(f)* Editing an image updates its thumbnail the next time the folder is listed — no stale picture.
+- [ ] *(f)* A corrupt image keeps its symbolic icon instead of showing a broken one, and Hive does not
+      retry it endlessly.
+- [ ] *(f)* A file over `max_file_bytes` is skipped and keeps its icon.
+- [ ] *(f)* A directory over `max_directory_entries` shows no thumbnails at all.
+- [ ] *(f)* `enabled = false` turns thumbnails off entirely on the next launch.
+- [ ] *(f)* Deleting `$XDG_CACHE_HOME/hive/thumbnails/` costs one redraw and nothing else.
+- [ ] *(f)* A very wide or very tall image does not distort the row or the grid cell.
+
+**Properties**
+
+- [ ] *(f)* `Ctrl+I` on a file shows name, location, type, exact size, timestamps, permissions, owner, group.
+- [ ] *(f)* `Ctrl+I` with nothing selected describes the folder you are in.
+- [ ] *(f)* Opening it on a folder computes **nothing** until Calculate is pressed.
+- [ ] *(f)* Calculate counts up live, and Cancel stops it and reports how far it got.
+- [ ] *(f)* Closing the dialog mid-walk stops the walk — no thread left counting.
+- [ ] *(f)* A folder containing a symlink loop finishes rather than running forever.
+- [ ] *(f)* A folder with unreadable subdirectories reports a count of what it could not read.
+- [ ] *(f)* Properties on a multi-selection reports the count and a combined size.
+- [ ] *(f)* Properties on a symlink describes the link and names its target.
+
+**Status line and animations**
+
+- [ ] *(f)* Item count, selection count and free space are all correct, and free space follows the folder.
+- [ ] *(f)* Free space updates after a large copy or delete rather than staying stale.
+- [ ] *(f)* Turning `gtk-enable-animations` off stops transitions immediately, without a restart.
+- [ ] *(f)* Switching list ↔ grid crossfades briefly and never re-enumerates the directory.
+
 **Config**
 
 - [ ] *(a)* Deleting `config.toml` regenerates defaults silently on next launch.
@@ -712,7 +847,9 @@ Every item marked *(a)* through *(e)* is verifiable now; the rest arrive with th
   directory.
 - **(e) — done.** Folder colors stored by accent slot with lazy pruning, and sidebar pinning with
   drag-to-pin, drag-to-reorder and right-click unpin.
-- **(f)** Polish: thumbnails, properties dialog with opt-in cancellable recursive size, status line, animations.
+- **(f) — done.** Image thumbnails on a capped worker pool with a two-level cache keyed on (path, mtime,
+  size); the properties dialog with opt-in, cancellable, incrementally-reported recursive size; the status
+  line; and the animation pass.
 
 Deliberately out of scope for v1: tabs, split panes, terminal embedding, archive management, network-mount UI,
 bulk rename, video thumbnails, and redo.

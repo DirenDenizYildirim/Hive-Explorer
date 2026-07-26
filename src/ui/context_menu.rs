@@ -116,6 +116,10 @@ fn selection_menu(window: &Rc<Window>) -> gio::Menu {
     remove.append(Some("Delete Permanently…"), Some("win.delete"));
     menu.append_section(None, &remove);
 
+    let inspect = gio::Menu::new();
+    inspect.append(Some("Properties"), Some("win.properties"));
+    menu.append_section(None, &inspect);
+
     menu
 }
 
@@ -136,6 +140,12 @@ fn folder_menu() -> gio::Menu {
     view.append(Some("Show Hidden Files"), Some("win.toggle-hidden"));
     view.append(Some("Undo"), Some("win.undo"));
     menu.append_section(None, &view);
+
+    // With nothing selected this describes the folder being viewed, which is
+    // where you go to ask how big it is.
+    let inspect = gio::Menu::new();
+    inspect.append(Some("Folder Properties"), Some("win.properties"));
+    menu.append_section(None, &inspect);
 
     menu
 }
