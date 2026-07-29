@@ -93,8 +93,14 @@ change.
 is resolved to an absolute path in the process you typed it in, before anything is handed to an
 already-running Hive. Getting this wrong would make `hive .` silently open the wrong folder.
 
-A second `hive` invocation activates the existing window and navigates it rather than starting a second
-process (`gio::ApplicationFlags::HANDLES_OPEN`).
+**A second `hive` invocation opens another window** in the process that is already running, rather than
+starting a second one (`gio::ApplicationFlags::HANDLES_OPEN`). Launching Hive again from a launcher is
+therefore how you get a second window, the same as `Ctrl+N`; closing the last window ends the process.
+
+Every launch is dispatched as `open`, including the one with nothing to open — home is what "no target"
+means. `GApplication::run` emits an `activate` of its own on top of whatever was dispatched, and on the far
+side of D-Bus the only thing that distinguishes the two is which signal arrived: so `open` makes windows and
+`activate` presents the newest one, and one launch cannot become two windows.
 
 ---
 
@@ -107,6 +113,7 @@ process (`gio::ApplicationFlags::HANDLES_OPEN`).
 | Mouse buttons 8 / 9 | Back / forward |
 | `Alt+Up` / `Backspace` | Parent folder (selects the folder you came from) |
 | `Alt+Home` | Home |
+| `Ctrl+N` | New window on the same folder |
 | `Ctrl+L` | Path entry — `Tab` completes, `Enter` goes, `Escape` cancels |
 | `Ctrl+F` | Filter this folder as you type; `Escape` clears and closes |
 | `Ctrl+A` | Select all |
@@ -116,7 +123,8 @@ process (`gio::ApplicationFlags::HANDLES_OPEN`).
 | `F10` | Main menu (including the flavor switcher) |
 | `F9` | Toggle sidebar |
 | Arrows, `Home`/`End`, `Page Up`/`Down` | Move the selection |
-| Click-drag, `Ctrl+click`, `Shift+click` | Multi-select |
+| Click-drag on empty space, `Ctrl+click`, `Shift+click` | Multi-select |
+| Drag a row | Move it into a folder, out to another application, or onto the sidebar to pin |
 | Type any letters | Type-ahead jump to the next matching name |
 | `Right-click`, `Menu`, `Shift+F10` | Context menu |
 
@@ -159,6 +167,44 @@ Off by default. Set `vim_keys = true` under `[behavior]`:
 
 ---
 
+## Sorting
+
+**Sort** is in the main menu (`F10`) and in the right-click menu over the folder — the same submenu in both
+places, so the two can never disagree about which ordering is active.
+
+| Key | Orders by |
+|---|---|
+| Name | Natural order: `file2` before `file10`, case-insensitive |
+| Size | Bytes. Folders never sort by their own size — they group and order by name |
+| Date Modified | When the contents last changed |
+| Date Added | When the entry turned up in this folder |
+| Type | Content type, then name |
+
+The direction is named after what it orders, because "ascending" answers a question nobody asked of a date:
+**Newest / Oldest First** for the two dates, **Largest / Smallest First** for size, **Ascending / Descending**
+for name and type. **Folders First** groups directories ahead of files under any key, and is on by default.
+
+**Date Added is not modification time**, and that difference is the point of having it. Copying a file
+preserves its modification time, so a photo taken last year and copied in this morning sorts a year deep under
+Date Modified while appearing at the top under Date Added. Linux keeps no record of when a file was put into a
+folder, so Hive uses the closest thing the filesystem has, in order:
+
+1. **Creation time** (`time::created`) — ext4, btrfs and xfs all report it. This is what a file copied or
+   downloaded into the folder gets.
+2. **The inode's change time** (`time::changed`), which a move into the folder, a replacement or a permission
+   change all update. Never absent on a local file.
+3. Modification time, for a filesystem that reports neither — which is what such a filesystem knows anyway.
+
+Ordering is **per window** while Hive is running: two windows on the same folder can be sorted differently,
+which is half the reason to have two. The last choice is saved as the default for the next window, and lives in
+`config.toml` under `[view]` — so it also survives a restart.
+
+Sorting never re-reads the directory: the sorter is a comparator over the model that is already loaded, so
+changing it costs one re-sort and nothing else. The selection is kept — it follows the files, not the row
+numbers — and a large folder re-sorts incrementally rather than freezing the window.
+
+---
+
 ## Configuration
 
 `$XDG_CONFIG_HOME/hive/config.toml`, written atomically and schema-versioned.
@@ -183,7 +229,7 @@ client_side_shadow = false    # let Hyprland shadow the window
 [view]
 mode = "list"                 # list | grid
 show_hidden = false
-sort_key = "name"             # name | size | modified | type
+sort_key = "name"             # name | size | modified | added | type
 sort_order = "ascending"      # ascending | descending
 folders_first = true
 
@@ -365,6 +411,49 @@ opens the grid, arrows move between swatches, `Return` applies.
 
 ---
 
+## Drag and drop
+
+Dragging works in both directions, and a drag out of Hive is a `text/uri-list` like any other — a browser's
+upload field, a chat window and another file manager all accept it. Under the hood the payload is a
+`GdkFileList` (which GDK serializes to `text/uri-list`, `text/plain` and the portal file-transfer types, so
+sandboxed applications get it too), plus a boxed type private to Hive carrying the same paths losslessly.
+
+**Where a drop can land:**
+
+| Drop on | Destination |
+|---|---|
+| A folder row, in either view | Inside that folder |
+| Anywhere else in the pane | The folder being viewed |
+| The sidebar | Nothing is transferred — the sidebar pins, see below |
+
+**Copy or move** is decided by where the drag came from, which is what the private payload is for:
+
+| Drag | Default | `Ctrl` | `Shift` |
+|---|---|---|---|
+| From Hive — another window, or a folder in this one | **Move** | Copy | Move |
+| From another application | **Copy** | Copy | Move, when that application offers one |
+
+Neither key can ask for something the source never offered: `Shift` over a drag that will only be copied is
+refused while the pointer is still over the row, rather than quietly copying instead. A drop reports what it
+did — "Moved 3 items" — and `Ctrl+Z` reverses it, because a drop runs the same worker, the same pre-flight and
+the same undo recording as `Ctrl+V`.
+
+Two more decided cases:
+
+- **Dropping into the folder the files are already in** is a fumble, not a request. As a move there is nothing
+  to do and Hive says so. As a copy it means what `Ctrl+D` means, so it keeps both rather than raising a
+  conflict dialog for every name in turn.
+- **Dropping a folder onto itself** drops that folder from the drag and carries out the rest, rather than
+  refusing the whole thing.
+
+Only files on this machine can be dropped in. A `https` URI dragged out of a browser has no path, and is
+refused with a message rather than turned into a path that looks real and is not.
+
+The cost of all this: starting a drag on a row no longer starts a rubber-band selection there — begin the
+rubber band on empty space instead, exactly as in every other file manager.
+
+---
+
 ## Pinned folders
 
 The **Pinned** section sits at the top of the sidebar and persists in `config.toml`.
@@ -377,11 +466,8 @@ The **Pinned** section sits at the top of the sidebar and persists in `config.to
 
 Pinned rows carry the folder's color, which is what makes a long list scannable at a glance.
 
-**Dragging is deliberately Hive-only.** The payload is a private boxed type, not a `GFile` or a
-`text/uri-list`, so no other application can accept the drag. Dragging files *out* to other applications is
-deferred to v1.1, and half of it working by accident would be worse than none of it. The cost is that
-starting a drag on a folder row no longer starts a rubber-band selection there — begin the rubber band on
-empty space instead, exactly as in every other file manager.
+Only folders can be pinned, and the pin payload says so: a drag carrying plain files offers the sidebar
+nothing it accepts, so it pins nothing rather than pinning the parent folder or half the selection.
 
 ---
 
@@ -620,9 +706,10 @@ src/
              recursive size walk                                      — policy is plain Rust
   ui/        window, sidebar, breadcrumb, file pane, status bar,
              clipboard, dialogs, progress, context menu, the colour
-             picker, the pin drag payload, the thumbnail worker pool
-             and the properties dialog                                — GTK layer, holds no policy
-  app.rs     adw::Application, HANDLES_OPEN, startup
+             picker, the drag payloads and drop targets, the thumbnail
+             worker pool and the properties dialog                    — GTK layer, holds no policy
+  app.rs     adw::Application, HANDLES_OPEN, startup, a window per
+             launch over one shared config, theme and colour store
   cli.rs     argument parsing                                         — unit-tested
 ```
 
@@ -631,7 +718,7 @@ The listing is built on GTK's own list infrastructure rather than a hand-rolled 
 ```
 gtk::DirectoryList          async, incremental, monitored, io_priority tuned
   └─ gtk::FilterListModel     hidden-file toggle, substring filter
-       └─ gtk::SortListModel    name / size / modified / type, folders-first
+       └─ gtk::SortListModel    name / size / modified / added / type, folders-first
             └─ gtk::MultiSelection
                  └─ gtk::ColumnView (list)  |  gtk::GridView (grid)
 ```
@@ -758,8 +845,26 @@ Every item here is verifiable now.
 - [ ] *(e)* Right-click a pinned row → Unpin removes it.
 - [ ] *(e)* Unpin from Sidebar in the pane's context menu removes it.
 - [ ] *(e)* A pinned folder that no longer exists is dimmed rather than deleted, and can still be unpinned.
-- [ ] *(e)* Dragging a folder over another application refuses the drop — Hive's drags stay inside Hive.
+- [ ] *(e)* Dragging plain files onto the sidebar pins nothing, and transfers nothing.
 - [ ] *(e)* Rubber-band selection still works when started on empty space in the pane.
+
+**Drag and drop**
+
+- [ ] *(g)* Dragging a row onto a folder row moves it inside, in both list and grid view.
+- [ ] *(g)* Dragging between two Hive windows moves; `Ctrl` while dropping copies instead.
+- [ ] *(g)* Dropping files back into the folder they came from says so, and moves nothing; with `Ctrl` it
+      duplicates them instead of raising a conflict dialog.
+- [ ] *(g)* Dragging a file out to a browser's upload field, or a chat window, hands over the real file.
+- [ ] *(g)* Dragging files from another file manager into Hive copies them in, with progress and a toast.
+- [ ] *(g)* `Ctrl+Z` reverses a drop — a move goes back, a copy is deleted.
+
+**Sorting**
+
+- [ ] *(g)* Sort → Date Added, Newest First puts a file copied in this morning above one edited today.
+- [ ] *(g)* Switching between Date Added and Date Modified gives different orders for the same folder.
+- [ ] *(g)* Choosing a date key relabels the direction to Newest / Oldest First, in both menus.
+- [ ] *(g)* Two windows on one folder can be sorted differently, and the last choice is what a new window gets.
+- [ ] *(g)* The ordering survives a restart, and a hand-edited nonsense `sort_key` falls back to name.
 
 **Thumbnails**
 
@@ -850,6 +955,10 @@ Every item here is verifiable now.
 - **(f) — done.** Image thumbnails on a capped worker pool with a two-level cache keyed on (path, mtime,
   size); the properties dialog with opt-in, cancellable, incrementally-reported recursive size; the status
   line; and the animation pass.
+- **(g) — done.** Several windows — one per launch, and `Ctrl+N` — and drag and drop of files in both
+  directions: out to any application as `text/uri-list`, in from any application, and between Hive's own
+  windows and folders, running the same worker, pre-flight and undo recording as paste. Also the Sort menu the
+  ordering options had been missing, and a Date Added key to go in it.
 
 Deliberately out of scope for v1: tabs, split panes, terminal embedding, archive management, network-mount UI,
 bulk rename, video thumbnails, and redo.

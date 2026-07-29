@@ -1,3 +1,8 @@
+# No DBusActivatable. Hive is launched through Exec on purpose: a launcher that
+# activates over D-Bus instead needs a matching dbus-1 service file to cold-start
+# at all, and a second activation of a running instance presents the window it
+# already has rather than opening another one. Launching Hive again is meant to
+# give you another window — see "Command line" in the README.
 [Desktop Entry]
 Type=Application
 Version=1.5
@@ -12,4 +17,3 @@ Categories=System;FileTools;FileManager;Utility;
 MimeType=inode/directory;
 StartupNotify=true
 StartupWMClass=dev.diren.Hive
-DBusActivatable=true

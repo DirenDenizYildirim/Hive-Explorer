@@ -11,7 +11,7 @@ use crate::config::{self, Config, ViewMode, defaults};
 use crate::fs::open;
 use crate::model::History;
 use crate::model::filter::FilterSpec;
-use crate::model::sort::SortSpec;
+use crate::model::sort::{SortKey, SortOrder, SortSpec};
 use crate::model::undo;
 use crate::theme::{Registry, StyleOptions, ThemeProvider, system};
 use crate::ui::breadcrumb::Breadcrumb;
@@ -66,6 +66,12 @@ pub struct Window {
     /// The Flavor submenu, rebuilt whenever the theme list changes.
     flavor_menu: gio::Menu,
     pub(crate) flavor_action: gio::SimpleAction,
+    /// The Sort submenu, rebuilt whenever the key changes.
+    ///
+    /// The direction's name depends on what is being ordered — "Newest First"
+    /// for a date, "Largest First" for a size — so the labels cannot be written
+    /// once and left alone.
+    sort_menu: gio::Menu,
 }
 
 impl Window {
@@ -211,6 +217,7 @@ impl Window {
             last_toast: RefCell::new(None),
             flavor_menu: gio::Menu::new(),
             flavor_action,
+            sort_menu: gio::Menu::new(),
         });
 
         this.build_header(&header);
@@ -222,6 +229,7 @@ impl Window {
         this.wire_thumbnails();
         this.wire_animations();
         this.install_actions(app);
+        this.install_sort_actions();
         this.install_operation_actions(app);
         this.wire_close_request();
         context_menu::install(&this);
@@ -266,6 +274,10 @@ impl Window {
 
         let menu = gio::Menu::new();
 
+        let window_section = gio::Menu::new();
+        window_section.append(Some("New Window"), Some("win.new-window"));
+        menu.append_section(None, &window_section);
+
         let create_section = gio::Menu::new();
         create_section.append(Some("New Folder…"), Some("win.new-folder"));
         create_section.append(Some("New File…"), Some("win.new-file"));
@@ -277,6 +289,8 @@ impl Window {
         menu.append_section(None, &edit_section);
 
         let view_section = gio::Menu::new();
+        view_section.append_submenu(Some("Sort"), &self.sort_menu);
+        self.rebuild_sort_menu();
         view_section.append(Some("Show Hidden Files"), Some("win.toggle-hidden"));
         view_section.append(Some("Grid View"), Some("win.toggle-view"));
         view_section.append(Some("Properties"), Some("win.properties"));
@@ -310,7 +324,10 @@ impl Window {
         let this = Rc::clone(self);
         let button = view_toggle.clone();
         view_toggle.connect_clicked(move |_| {
-            let next = this.config.borrow().view.mode.toggled();
+            // This window's own pane, not the config: another window may have
+            // switched since, and toggling away from a mode this pane is not in
+            // would spend the first click doing nothing visible.
+            let next = this.file_pane.view_mode().toggled();
             this.set_view_mode(next);
             button.set_icon_name(view_icon(next));
         });
@@ -343,6 +360,12 @@ impl Window {
         self.file_pane.connect_error(move |error| {
             this.handle_enumeration_error(&error);
         });
+
+        let this = Rc::clone(self);
+        self.file_pane
+            .connect_drop(move |sources, destination, action| {
+                this.accept_drop(sources, destination, action);
+            });
 
         let this = Rc::clone(self);
         self.back_button.connect_clicked(move |_| this.go_back());
@@ -749,7 +772,13 @@ impl Window {
         );
         let this = Rc::clone(self);
         toggle_hidden.connect_activate(move |action, _| {
-            let next = !this.config.borrow().view.show_hidden;
+            // The action's own state rather than the config, for the same reason
+            // the view toggle reads its pane: each window toggles itself.
+            let showing = action
+                .state()
+                .and_then(|state| state.get::<bool>())
+                .unwrap_or_default();
+            let next = !showing;
             action.set_state(&next.to_variant());
             this.set_show_hidden(next);
         });
@@ -812,6 +841,7 @@ impl Window {
                 }),
             ),
             ("properties", Box::new(|w: &Rc<Window>| w.show_properties())),
+            ("new-window", Box::new(|w: &Rc<Window>| w.open_new_window())),
         ];
 
         for (name, handler) in simple {
@@ -833,6 +863,168 @@ impl Window {
         app.set_accels_for_action("win.open-path", &["<Control>l"]);
         app.set_accels_for_action("win.find", &["<Control>f"]);
         app.set_accels_for_action("win.appearance", &["<Control>comma"]);
+        app.set_accels_for_action("win.new-window", &["<Control>n"]);
+    }
+
+    /// The three ordering choices, as stateful actions the menu can show.
+    ///
+    /// Each acts on this window's own pane and saves the result as the default
+    /// for the next window, the same way the view mode does. Ordering is per
+    /// window while Hive is running: two windows on the same folder can be sorted
+    /// differently, which is half the reason to have two.
+    fn install_sort_actions(self: &Rc<Self>) {
+        let spec = self.file_pane.sort_spec();
+
+        let key = gio::SimpleAction::new_stateful(
+            "sort-key",
+            Some(glib::VariantTy::STRING),
+            &spec.key.id().to_variant(),
+        );
+        let this = Rc::clone(self);
+        key.connect_activate(move |action, parameter| {
+            let Some(chosen) = parameter
+                .and_then(glib::Variant::str)
+                .and_then(SortKey::from_id)
+            else {
+                tracing::warn!(?parameter, "ignoring an unknown sort key");
+                return;
+            };
+
+            action.set_state(&chosen.id().to_variant());
+            let mut spec = this.file_pane.sort_spec();
+            spec.key = chosen;
+            this.set_sort(spec);
+            // The direction's label is named after the key, so it has changed.
+            this.rebuild_sort_menu();
+        });
+        self.window.add_action(&key);
+
+        let order = gio::SimpleAction::new_stateful(
+            "sort-order",
+            Some(glib::VariantTy::STRING),
+            &spec.order.id().to_variant(),
+        );
+        let this = Rc::clone(self);
+        order.connect_activate(move |action, parameter| {
+            let Some(chosen) = parameter
+                .and_then(glib::Variant::str)
+                .and_then(SortOrder::from_id)
+            else {
+                tracing::warn!(?parameter, "ignoring an unknown sort order");
+                return;
+            };
+
+            action.set_state(&chosen.id().to_variant());
+            let mut spec = this.file_pane.sort_spec();
+            spec.order = chosen;
+            this.set_sort(spec);
+        });
+        self.window.add_action(&order);
+
+        let folders_first = gio::SimpleAction::new_stateful(
+            "folders-first",
+            None,
+            &spec.folders_first.to_variant(),
+        );
+        let this = Rc::clone(self);
+        folders_first.connect_activate(move |action, _| {
+            let grouped = action
+                .state()
+                .and_then(|state| state.get::<bool>())
+                .unwrap_or_default();
+            let next = !grouped;
+            action.set_state(&next.to_variant());
+
+            let mut spec = this.file_pane.sort_spec();
+            spec.folders_first = next;
+            this.set_sort(spec);
+        });
+        self.window.add_action(&folders_first);
+    }
+
+    /// Reorder this window, and remember the choice for the next one.
+    pub fn set_sort(self: &Rc<Self>, spec: SortSpec) {
+        if spec == self.file_pane.sort_spec() {
+            return;
+        }
+
+        tracing::debug!(
+            key = spec.key.id(),
+            order = spec.order.id(),
+            folders_first = spec.folders_first,
+            "reordering"
+        );
+        self.file_pane.set_sort(spec);
+
+        {
+            let mut config = self.config.borrow_mut();
+            config.view.sort_key = spec.key;
+            config.view.sort_order = spec.order;
+            config.view.folders_first = spec.folders_first;
+        }
+        self.save_config();
+    }
+
+    /// Fill the Sort submenu for the key that is currently active.
+    pub(crate) fn rebuild_sort_menu(self: &Rc<Self>) {
+        let active = self.file_pane.sort_spec().key;
+        self.sort_menu.remove_all();
+
+        let keys = gio::Menu::new();
+        for key in SortKey::ALL {
+            let item = gio::MenuItem::new(Some(key.display_name()), None);
+            item.set_action_and_target_value(Some("win.sort-key"), Some(&key.id().to_variant()));
+            keys.append_item(&item);
+        }
+        self.sort_menu.append_section(None, &keys);
+
+        let directions = gio::Menu::new();
+        for order in SortOrder::ALL {
+            let item = gio::MenuItem::new(Some(order.display_name(active)), None);
+            item.set_action_and_target_value(
+                Some("win.sort-order"),
+                Some(&order.id().to_variant()),
+            );
+            directions.append_item(&item);
+        }
+        self.sort_menu.append_section(None, &directions);
+
+        let grouping = gio::Menu::new();
+        grouping.append(Some("Folders First"), Some("win.folders-first"));
+        self.sort_menu.append_section(None, &grouping);
+    }
+
+    /// The Sort submenu, for the context menu to show as well.
+    pub(crate) fn sort_menu(&self) -> &gio::Menu {
+        &self.sort_menu
+    }
+
+    /// Open a second window on the same folder.
+    ///
+    /// Two windows side by side is how a file gets dragged from one folder to
+    /// another without leaving either, so this is a first-class action rather
+    /// than a curiosity. Everything the windows share — the config, the theme,
+    /// the folder colors — is shared by reference, so there is one of each and
+    /// not one per window.
+    fn open_new_window(self: &Rc<Self>) {
+        let Some(app) = self.window.application().and_downcast::<adw::Application>() else {
+            tracing::warn!("no application to hang a new window on");
+            return;
+        };
+
+        let window = Window::new(
+            &app,
+            Rc::clone(&self.config),
+            Rc::clone(&self.registry),
+            Rc::clone(&self.colors),
+            self.theme.clone(),
+        );
+
+        match self.location() {
+            Some(file) => window.navigate_to(&file),
+            None => window.navigate_home(),
+        }
+        window.present();
     }
 
     /// Actions for everything in §8's operation list, plus their accelerators.

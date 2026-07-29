@@ -43,7 +43,7 @@ pub fn install(window: &Rc<Window>) {
                 selection_menu(&this)
             } else {
                 this.file_pane.unselect_all();
-                folder_menu()
+                folder_menu(&this)
             };
 
             by_pointer.set_menu_model(Some(&model));
@@ -60,7 +60,7 @@ pub fn install(window: &Rc<Window>) {
         let model = if this.file_pane.selected_count() > 0 {
             selection_menu(&this)
         } else {
-            folder_menu()
+            folder_menu(&this)
         };
         popover.set_menu_model(Some(&model));
         attach_color_picker(&this, &popover);
@@ -123,7 +123,7 @@ fn selection_menu(window: &Rc<Window>) -> gio::Menu {
     menu
 }
 
-fn folder_menu() -> gio::Menu {
+fn folder_menu(window: &Rc<Window>) -> gio::Menu {
     let menu = gio::Menu::new();
 
     let create = gio::Menu::new();
@@ -136,7 +136,11 @@ fn folder_menu() -> gio::Menu {
     clipboard.append(Some("Select All"), Some("win.select-all"));
     menu.append_section(None, &clipboard);
 
+    // Right-clicking the folder is where one goes to ask how it is arranged, so
+    // the same submenu the main menu carries is here too — the one instance, so
+    // the two can never disagree about which ordering is active.
     let view = gio::Menu::new();
+    view.append_submenu(Some("Sort"), window.sort_menu());
     view.append(Some("Show Hidden Files"), Some("win.toggle-hidden"));
     view.append(Some("Undo"), Some("win.undo"));
     menu.append_section(None, &view);

@@ -19,6 +19,7 @@ use crate::model::path::display_name;
 use crate::model::preflight::Kind;
 use crate::model::undo::{Moved, Operation};
 use crate::ui::dialogs;
+use crate::ui::dnd::DropAction;
 use crate::ui::progress::{Progress, SHOW_AFTER};
 use crate::ui::window::Window;
 
@@ -119,6 +120,69 @@ impl Window {
         // Every name collides with its own original, and the answer is always
         // the same, so the conflict dialog would only be in the way.
         let job = self.transfer(Kind::Copy, paths, destination, Some(ops::Action::KeepBoth));
+        self.run_job(job, Record::Auto);
+    }
+
+    // ---- drag and drop ---------------------------------------------------
+
+    /// Files dropped on the pane, on a folder row, or from another application.
+    ///
+    /// Dropping into the folder the files already live in is a fumble rather
+    /// than a request: as a move there is nothing to do, and as a copy it means
+    /// the same thing Ctrl+D does, so it keeps both rather than asking about
+    /// every name in turn.
+    pub fn accept_drop(
+        self: &Rc<Self>,
+        sources: Vec<PathBuf>,
+        destination: PathBuf,
+        action: DropAction,
+    ) {
+        if sources.is_empty() {
+            self.show_toast("Only files on this computer can be dropped into Hive");
+            return;
+        }
+
+        if !destination.is_dir() {
+            self.show_toast("Cannot drop anything here");
+            return;
+        }
+
+        // Dropping a folder onto itself is a slip of the hand, and the rest of
+        // the drag is still worth carrying out.
+        let sources: Vec<PathBuf> = sources
+            .into_iter()
+            .filter(|source| source != &destination)
+            .collect();
+        if sources.is_empty() {
+            return;
+        }
+
+        let in_place = sources
+            .iter()
+            .all(|source| source.parent() == Some(destination.as_path()));
+
+        let kind = match action {
+            DropAction::Copy => Kind::Copy,
+            DropAction::Move => Kind::Move,
+        };
+
+        if in_place {
+            if kind == Kind::Move {
+                self.show_toast("Those files are already in this folder");
+                return;
+            }
+            let job = self.transfer(kind, sources, destination, Some(ops::Action::KeepBoth));
+            self.run_job(job, Record::Auto);
+            return;
+        }
+
+        tracing::debug!(
+            count = sources.len(),
+            destination = %destination.display(),
+            ?kind,
+            "accepting a drop"
+        );
+        let job = self.transfer(kind, sources, destination, None);
         self.run_job(job, Record::Auto);
     }
 

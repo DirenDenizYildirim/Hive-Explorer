@@ -12,7 +12,7 @@ use crate::config::ViewMode;
 use crate::model::filter::{self, FilterInput, FilterSpec};
 use crate::model::sort::{self, SortKeyData, SortSpec};
 use crate::theme::palette::Accent;
-use crate::ui::dnd::FolderDrag;
+use crate::ui::dnd::{self, Dragged, DropAction};
 use crate::ui::thumbnails::Thumbnailer;
 
 /// Attributes requested from every entry.
@@ -27,7 +27,11 @@ const ATTRIBUTES: &str = concat!(
     "standard::symlink-target,",
     "standard::symbolic-icon,",
     "standard::content-type,",
-    "time::modified",
+    "time::modified,",
+    // For the "Date Added" ordering. Both are asked for because neither is
+    // guaranteed: see `added_seconds`.
+    "time::created,",
+    "time::changed",
 );
 
 /// Icon edge in the list view. Small enough that a thumbnail here is a hint
@@ -60,6 +64,13 @@ type LiveRows = Rc<RefCell<Vec<glib::WeakRef<gtk::ListItem>>>>;
 
 /// Shared folder-color lookup, read on every bind.
 type Colors = Rc<RefCell<colors::Store>>;
+
+/// What to do with files dropped on the pane, set by the window.
+///
+/// Every row's drop target is built during factory setup, long before the window
+/// has wired anything up, so they all read the handler out of one shared slot
+/// rather than capturing it.
+type DropSlot = Rc<RefCell<Option<Rc<dyn Fn(Vec<PathBuf>, PathBuf, DropAction)>>>>;
 
 pub struct FilePane {
     /// A plain box wrapping the view stack.
@@ -95,6 +106,7 @@ pub struct FilePane {
     colors: Colors,
     thumbnails: Rc<Thumbnailer>,
     rows: LiveRows,
+    drops: DropSlot,
 }
 
 impl FilePane {
@@ -151,6 +163,7 @@ impl FilePane {
                     is_dir: is_directory(a),
                     size: a.size(),
                     modified: modified_seconds(a),
+                    added: added_seconds(a),
                     content_type: &a_type,
                 };
                 let right = SortKeyData {
@@ -158,6 +171,7 @@ impl FilePane {
                     is_dir: is_directory(b),
                     size: b.size(),
                     modified: modified_seconds(b),
+                    added: added_seconds(b),
                     content_type: &b_type,
                 };
 
@@ -173,12 +187,14 @@ impl FilePane {
 
         let right_clicked = Rc::new(Cell::new(None));
         let rows: LiveRows = Rc::new(RefCell::new(Vec::new()));
+        let drops: DropSlot = Rc::new(RefCell::new(None));
         let column_view = build_column_view(
             &selection,
             &right_clicked,
             &colors,
             &thumbnails,
             &rows,
+            &drops,
             ICON_SIZE_LIST,
         );
         let grid_view = build_grid_view(
@@ -187,6 +203,7 @@ impl FilePane {
             &colors,
             &thumbnails,
             &rows,
+            &drops,
             ICON_SIZE_GRID,
         );
 
@@ -201,6 +218,16 @@ impl FilePane {
         let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
         container.append(&stack);
         container.add_css_class("hive-file-pane");
+
+        // Anything dropped on the pane itself, rather than on a folder row,
+        // lands in the folder being viewed.
+        let location = directory_list.clone();
+        let target = dnd::file_target(
+            dnd::DROP_CLASS,
+            move || location.file().and_then(|file| file.path()),
+            dispatch_drop(&drops),
+        );
+        container.add_controller(target);
 
         let this = Rc::new(Self {
             container,
@@ -220,6 +247,7 @@ impl FilePane {
             colors,
             thumbnails,
             rows,
+            drops,
         });
 
         // A directory bigger than the configured cap gets no thumbnails at all.
@@ -596,6 +624,14 @@ impl FilePane {
         }
     }
 
+    /// Run `handler` when files are dropped on the pane or on a folder row.
+    ///
+    /// The second argument is where they were dropped: the folder under the
+    /// pointer, or the folder being viewed when the drop missed every row.
+    pub fn connect_drop(&self, handler: impl Fn(Vec<PathBuf>, PathBuf, DropAction) + 'static) {
+        *self.drops.borrow_mut() = Some(Rc::new(handler));
+    }
+
     /// Notify when enumeration fails: permission denied, vanished, unmounted.
     pub fn connect_error(&self, handler: impl Fn(glib::Error) + 'static) {
         self.directory_list.connect_error_notify(move |list| {
@@ -739,37 +775,67 @@ fn apply_icon(icon: &gtk::Image, info: &gio::FileInfo) {
     }
 }
 
-/// Let a folder be dragged onto the sidebar to pin it.
-///
-/// Only folders start a drag, and the payload is Hive's own boxed type, so a
-/// drag never reaches another application. Dragging files out is v1.1.
+/// Let a row be dragged: into another folder, onto the sidebar, or out of Hive.
 fn watch_drag(
     item: &gtk::ListItem,
     child: &impl IsA<gtk::Widget>,
     selection: &gtk::MultiSelection,
 ) {
     let source = gtk::DragSource::new();
-    source.set_actions(gtk::gdk::DragAction::COPY);
+    // Move is offered as well as copy so a drag inside Hive can be one; what a
+    // drop actually does is decided by `dnd::resolve` at the far end.
+    source.set_actions(gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE);
 
     let item = item.clone();
     let selection = selection.clone();
     let widget = child.as_ref().clone();
 
     source.connect_prepare(move |source, _, _| {
-        let paths = draggable_folders(&item, &selection);
-        if paths.is_empty() {
-            return None;
-        }
+        let content = dnd::payload(dragged_from(&item, &selection))?;
 
         // A picture of the row itself, so what is under the cursor is the thing
         // being dragged rather than an anonymous rectangle.
         let paintable = gtk::WidgetPaintable::new(Some(&widget));
         source.set_icon(Some(&paintable), 0, 0);
 
-        Some(FolderDrag::new(paths).content())
+        Some(content)
     });
 
     child.as_ref().add_controller(source);
+}
+
+/// Let a folder row take a drop of its own, so files land inside it.
+///
+/// A row that is not a folder refuses, and the drop reaches the pane behind it
+/// instead — which puts the files in the folder being viewed.
+fn watch_drop(item: &gtk::ListItem, child: &impl IsA<gtk::Widget>, drops: &DropSlot) {
+    let item = item.clone();
+    let target = dnd::file_target(
+        dnd::DROP_INTO_CLASS,
+        move || folder_of(&item),
+        dispatch_drop(drops),
+    );
+    child.as_ref().add_controller(target);
+}
+
+/// Hand a drop to whatever the window last registered, if it registered one.
+fn dispatch_drop(drops: &DropSlot) -> impl Fn(Vec<PathBuf>, PathBuf, DropAction) + 'static {
+    let drops = Rc::clone(drops);
+    move |sources, destination, action| {
+        let handler = drops.borrow().clone();
+        if let Some(handler) = handler {
+            handler(sources, destination, action);
+        }
+    }
+}
+
+/// The folder a row stands for, or `None` when the row is not one.
+fn folder_of(item: &gtk::ListItem) -> Option<PathBuf> {
+    let info = item
+        .item()
+        .and_then(|object| object.downcast::<gio::FileInfo>().ok())
+        .filter(is_directory)?;
+    file_of(&info)?.path()
 }
 
 /// What a drag starting on this row should carry.
@@ -777,19 +843,57 @@ fn watch_drag(
 /// Dragging a row inside a multi-selection takes the whole selection; dragging
 /// one outside it takes just that row, which is what every other file manager
 /// does and what the eye expects.
-fn draggable_folders(item: &gtk::ListItem, selection: &gtk::MultiSelection) -> Vec<PathBuf> {
+fn dragged_from(item: &gtk::ListItem, selection: &gtk::MultiSelection) -> Dragged {
     let position = item.position();
     if selection.selection().contains(position) {
-        return selected_directories(selection);
+        return dragged_selection(selection);
     }
 
-    item.item()
+    let Some(info) = item
+        .item()
         .and_then(|object| object.downcast::<gio::FileInfo>().ok())
-        .filter(is_directory)
-        .and_then(|info| file_of(&info))
-        .and_then(|file| file.path())
-        .map(|path| vec![path])
-        .unwrap_or_default()
+    else {
+        return Dragged::default();
+    };
+    let Some(path) = file_of(&info).and_then(|file| file.path()) else {
+        return Dragged::default();
+    };
+
+    Dragged {
+        folders: if is_directory(&info) {
+            vec![path.clone()]
+        } else {
+            Vec::new()
+        },
+        paths: vec![path],
+    }
+}
+
+fn dragged_selection(selection: &gtk::MultiSelection) -> Dragged {
+    let selected = selection.selection();
+    let mut dragged = Dragged::default();
+
+    for index in 0..selection.n_items() {
+        if !selected.contains(index) {
+            continue;
+        }
+        let Some(info) = selection
+            .item(index)
+            .and_then(|object| object.downcast::<gio::FileInfo>().ok())
+        else {
+            continue;
+        };
+        let Some(path) = file_of(&info).and_then(|file| file.path()) else {
+            continue;
+        };
+
+        if is_directory(&info) {
+            dragged.folders.push(path.clone());
+        }
+        dragged.paths.push(path);
+    }
+
+    dragged
 }
 
 fn selected_directories(selection: &gtk::MultiSelection) -> Vec<PathBuf> {
@@ -843,6 +947,7 @@ fn build_column_view(
     colors: &Colors,
     thumbnails: &Rc<Thumbnailer>,
     rows: &LiveRows,
+    drops: &DropSlot,
     icon_size: i32,
 ) -> gtk::ColumnView {
     let view = gtk::ColumnView::builder()
@@ -861,6 +966,7 @@ fn build_column_view(
         colors,
         thumbnails,
         rows,
+        drops,
         icon_size,
     ));
 
@@ -907,6 +1013,7 @@ fn name_column(
     colors: &Colors,
     thumbnails: &Rc<Thumbnailer>,
     rows: &LiveRows,
+    drops: &DropSlot,
     icon_size: i32,
 ) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
@@ -914,6 +1021,7 @@ fn name_column(
     let for_setup = selection.clone();
     let right_clicked = Rc::clone(right_clicked);
     let setup_rows = Rc::clone(rows);
+    let setup_drops = Rc::clone(drops);
     factory.connect_setup(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
@@ -932,6 +1040,7 @@ fn name_column(
         item.set_child(Some(&row));
         watch_right_click(item, &row, &right_clicked, &for_setup);
         watch_drag(item, &row, &for_setup);
+        watch_drop(item, &row, &setup_drops);
         register_row(&setup_rows, item);
     });
 
@@ -1029,6 +1138,7 @@ fn build_grid_view(
     colors: &Colors,
     thumbnails: &Rc<Thumbnailer>,
     rows: &LiveRows,
+    drops: &DropSlot,
     icon_size: i32,
 ) -> gtk::GridView {
     let factory = gtk::SignalListItemFactory::new();
@@ -1036,6 +1146,7 @@ fn build_grid_view(
     let for_setup = selection.clone();
     let right_clicked = Rc::clone(right_clicked);
     let setup_rows = Rc::clone(rows);
+    let setup_drops = Rc::clone(drops);
     factory.connect_setup(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
@@ -1063,6 +1174,7 @@ fn build_grid_view(
         item.set_child(Some(&cell));
         watch_right_click(item, &cell, &right_clicked, &for_setup);
         watch_drag(item, &cell, &for_setup);
+        watch_drop(item, &cell, &setup_drops);
         register_row(&setup_rows, item);
     });
 
@@ -1139,6 +1251,36 @@ fn modified_seconds(info: &gio::FileInfo) -> i64 {
     info.modification_date_time()
         .map(|dt| dt.to_unix())
         .unwrap_or(0)
+}
+
+/// When an entry turned up here, as closely as the filesystem can say.
+///
+/// Linux keeps no record of when a file was put into a folder, so this is the
+/// nearest honest answer, in order of preference:
+///
+/// 1. Creation time, where the filesystem has one — ext4, btrfs and xfs do.
+///    This is what a file copied or downloaded into the folder gets.
+/// 2. The inode's change time, which a move into the folder, a replacement or a
+///    permission change all update. It is never absent on a local file.
+/// 3. Modification time, for a filesystem that reports neither of the above.
+///
+/// Modification time on its own is the wrong answer to "what is new here":
+/// copying a file preserves it, so a photo taken last year and copied in this
+/// morning would sort a year deep.
+fn added_seconds(info: &gio::FileInfo) -> i64 {
+    for attribute in [
+        gio::FILE_ATTRIBUTE_TIME_CREATED,
+        gio::FILE_ATTRIBUTE_TIME_CHANGED,
+    ] {
+        if !info.has_attribute(attribute) {
+            continue;
+        }
+        let seconds = info.attribute_uint64(attribute);
+        if seconds > 0 {
+            return i64::try_from(seconds).unwrap_or(i64::MAX);
+        }
+    }
+    modified_seconds(info)
 }
 
 /// The `gio::File` `DirectoryList` attaches to each entry.

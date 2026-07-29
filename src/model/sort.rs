@@ -12,14 +12,17 @@ pub enum SortKey {
     Name,
     Size,
     Modified,
+    /// When the entry turned up here, rather than when its contents changed.
+    Added,
     Type,
 }
 
 impl SortKey {
-    pub const ALL: [SortKey; 4] = [
+    pub const ALL: [SortKey; 5] = [
         SortKey::Name,
         SortKey::Size,
         SortKey::Modified,
+        SortKey::Added,
         SortKey::Type,
     ];
 
@@ -28,6 +31,7 @@ impl SortKey {
             SortKey::Name => "name",
             SortKey::Size => "size",
             SortKey::Modified => "modified",
+            SortKey::Added => "added",
             SortKey::Type => "type",
         }
     }
@@ -36,7 +40,8 @@ impl SortKey {
         match self {
             SortKey::Name => "Name",
             SortKey::Size => "Size",
-            SortKey::Modified => "Modified",
+            SortKey::Modified => "Date Modified",
+            SortKey::Added => "Date Added",
             SortKey::Type => "Type",
         }
     }
@@ -56,6 +61,8 @@ pub enum SortOrder {
 }
 
 impl SortOrder {
+    pub const ALL: [SortOrder; 2] = [SortOrder::Ascending, SortOrder::Descending];
+
     pub const fn is_descending(self) -> bool {
         matches!(self, SortOrder::Descending)
     }
@@ -65,6 +72,32 @@ impl SortOrder {
             SortOrder::Ascending => SortOrder::Descending,
             SortOrder::Descending => SortOrder::Ascending,
         }
+    }
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            SortOrder::Ascending => "ascending",
+            SortOrder::Descending => "descending",
+        }
+    }
+
+    /// What the direction means for the active key, rather than "ascending".
+    ///
+    /// "Ascending" answers a question nobody asked of a date; "Oldest first"
+    /// answers the one they did.
+    pub const fn display_name(self, key: SortKey) -> &'static str {
+        match (key, self) {
+            (SortKey::Modified | SortKey::Added, SortOrder::Ascending) => "Oldest First",
+            (SortKey::Modified | SortKey::Added, SortOrder::Descending) => "Newest First",
+            (SortKey::Size, SortOrder::Ascending) => "Smallest First",
+            (SortKey::Size, SortOrder::Descending) => "Largest First",
+            (_, SortOrder::Ascending) => "Ascending",
+            (_, SortOrder::Descending) => "Descending",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|order| order.id() == id)
     }
 }
 
@@ -96,6 +129,8 @@ pub struct SortKeyData<'a> {
     pub size: i64,
     /// Unix seconds. Unknown timestamps should be 0.
     pub modified: i64,
+    /// Unix seconds for when the entry appeared here. Unknown should be 0.
+    pub added: i64,
     pub content_type: &'a str,
 }
 
@@ -106,6 +141,7 @@ impl<'a> SortKeyData<'a> {
             is_dir,
             size: 0,
             modified: 0,
+            added: 0,
             content_type: "",
         }
     }
@@ -131,6 +167,7 @@ pub fn compare(a: &SortKeyData<'_>, b: &SortKeyData<'_>, spec: SortSpec) -> Orde
             }
         }
         SortKey::Modified => a.modified.cmp(&b.modified),
+        SortKey::Added => a.added.cmp(&b.added),
         SortKey::Type => natural_cmp(a.content_type, b.content_type),
     };
 
@@ -353,6 +390,68 @@ mod tests {
             sorted(vec![old, new, unknown], spec),
             ["new", "old", "unknown"]
         );
+    }
+
+    #[test]
+    fn added_sorts_by_its_own_timestamp_not_the_modification_one() {
+        // A file copied in keeps the modification time it was created with, so
+        // "newest first" by modification and by arrival are different orders —
+        // which is the whole reason the key exists.
+        let mut old_edit_new_arrival = file("copied-in");
+        old_edit_new_arrival.modified = 1_000;
+        old_edit_new_arrival.added = 9_000;
+
+        let mut new_edit_old_arrival = file("edited-here");
+        new_edit_old_arrival.modified = 8_000;
+        new_edit_old_arrival.added = 2_000;
+
+        let items = vec![old_edit_new_arrival, new_edit_old_arrival];
+        let newest_added = SortSpec::new(SortKey::Added, SortOrder::Descending, false);
+        assert_eq!(
+            sorted(items.clone(), newest_added),
+            ["copied-in", "edited-here"]
+        );
+
+        let newest_modified = SortSpec::new(SortKey::Modified, SortOrder::Descending, false);
+        assert_eq!(sorted(items, newest_modified), ["edited-here", "copied-in"]);
+    }
+
+    #[test]
+    fn entries_with_no_arrival_time_sort_last_when_newest_is_first() {
+        let mut known = file("known");
+        known.added = 500;
+        let unknown = file("unknown");
+
+        let spec = SortSpec::new(SortKey::Added, SortOrder::Descending, false);
+        assert_eq!(sorted(vec![unknown, known], spec), ["known", "unknown"]);
+    }
+
+    #[test]
+    fn a_direction_is_named_for_the_key_it_orders() {
+        assert_eq!(
+            SortOrder::Descending.display_name(SortKey::Added),
+            "Newest First"
+        );
+        assert_eq!(
+            SortOrder::Ascending.display_name(SortKey::Modified),
+            "Oldest First"
+        );
+        assert_eq!(
+            SortOrder::Descending.display_name(SortKey::Size),
+            "Largest First"
+        );
+        assert_eq!(
+            SortOrder::Ascending.display_name(SortKey::Name),
+            "Ascending"
+        );
+    }
+
+    #[test]
+    fn sort_order_ids_roundtrip() {
+        for order in SortOrder::ALL {
+            assert_eq!(SortOrder::from_id(order.id()), Some(order));
+        }
+        assert_eq!(SortOrder::from_id("sideways"), None);
     }
 
     #[test]

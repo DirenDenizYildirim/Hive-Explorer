@@ -23,7 +23,7 @@ const CURRENT_ROW_CLASS: &str = "hive-current";
 const MISSING_ROW_CLASS: &str = "hive-missing";
 
 /// Marks the sidebar while a folder is being dragged over it.
-const DROP_CLASS: &str = "hive-drop-active";
+const DROP_CLASS: &str = dnd::DROP_CLASS;
 
 type NavigateHandler = Rc<dyn Fn(gio::File)>;
 type PinsHandler = Rc<dyn Fn(PinEvent)>;

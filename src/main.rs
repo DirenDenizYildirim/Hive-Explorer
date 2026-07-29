@@ -50,13 +50,13 @@ fn main() -> glib::ExitCode {
         return glib::ExitCode::FAILURE;
     }
 
-    match target {
-        Some(path) => {
-            let hint = if args.reveal { app::REVEAL_HINT } else { "" };
-            application.open(&[gio::File::for_path(&path)], hint);
-        }
-        None => application.activate(),
-    }
+    // Every launch is dispatched as `open`, including one with nothing to open:
+    // `run` emits an `activate` of its own below, and a launch that opens a
+    // window has to be told apart from that one on the far side of D-Bus, where
+    // the only difference is which signal arrived. Home is what no target means.
+    let hint = if args.reveal { app::REVEAL_HINT } else { "" };
+    let path = target.unwrap_or_else(paths::home_dir);
+    application.open(&[gio::File::for_path(&path)], hint);
 
     if application.is_remote() {
         tracing::debug!("handed off to the running instance");
@@ -64,9 +64,10 @@ fn main() -> glib::ExitCode {
 
     // Run even when remote. The dispatch above has already delivered the target,
     // and for a remote instance `run` returns straight away — but it is also
-    // what tears the D-Bus registration down cleanly. Returning early instead
-    // leaves the application finalized while still registered, which GIO warns
-    // about on stderr. The extra `activate` it emits is harmless: the primary
-    // instance just presents the window it already has.
+    // what flushes that message onto the bus and tears the D-Bus registration
+    // down cleanly. Returning early instead leaves the application finalized
+    // while still registered, which GIO warns about on stderr. The extra
+    // `activate` it emits presents the window the `open` just made, and never
+    // makes one of its own.
     application.run_with_args::<&str>(&[program.to_string_lossy().as_ref()])
 }

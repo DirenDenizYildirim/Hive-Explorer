@@ -364,6 +364,18 @@ popover > arrow {{
   background-color: {base};
 }}
 
+/* Where a drop would land: an inset ring when it is the folder being viewed,
+   and the row itself when it is a folder inside it. Inset rather than a border,
+   so nothing reflows and the rows do not shift under the pointer. */
+.hive-file-pane.hive-drop-active {{
+  box-shadow: inset 0 0 0 2px {accent};
+}}
+
+.hive-drop-into {{
+  background-color: {accent_soft};
+  border-radius: 6px;
+}}
+
 .hive-file-pane listview > row,
 .hive-file-pane columnview > listview > row {{
   padding: 2px 4px;

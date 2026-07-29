@@ -33,7 +33,6 @@ pub fn build() -> adw::Application {
         .build();
 
     let state: Rc<RefCell<Option<Rc<AppState>>>> = Rc::new(RefCell::new(None));
-    let window: Rc<RefCell<Option<Rc<Window>>>> = Rc::new(RefCell::new(None));
 
     {
         let state = Rc::clone(&state);
@@ -44,27 +43,36 @@ pub fn build() -> adw::Application {
 
     {
         let state = Rc::clone(&state);
-        let window = Rc::clone(&window);
         app.connect_activate(move |app| {
+            // Every launch reaches Hive as `open`, including the one carrying
+            // nothing — see `main`. `run` then emits an activate of its own on
+            // top of it, so activate presents what is already there rather than
+            // opening a window: otherwise one launch would produce two.
+            if let Some(window) = app.active_window() {
+                window.present();
+                return;
+            }
+
             let Some(state) = state.borrow().clone() else {
                 return;
             };
-            let window = ensure_window(app, &state, &window);
-            if window.location().is_none() {
-                window.navigate_home();
-            }
+            let window = new_window(app, &state);
+            window.navigate_home();
             window.present();
         });
     }
 
     {
         let state = Rc::clone(&state);
-        let window = Rc::clone(&window);
         app.connect_open(move |app, files, hint| {
             let Some(state) = state.borrow().clone() else {
                 return;
             };
-            let window = ensure_window(app, &state, &window);
+
+            // A launch while Hive is already running opens another window, the
+            // way every other file manager does. Two windows is also the only
+            // way to drag a file from one folder to another and watch both.
+            let window = new_window(app, &state);
 
             // The hint carries the intent across the D-Bus handoff to an
             // already-running instance, which plain argv cannot do.
@@ -156,15 +164,11 @@ fn register_resources() {
     }
 }
 
-fn ensure_window(
-    app: &adw::Application,
-    state: &Rc<AppState>,
-    slot: &Rc<RefCell<Option<Rc<Window>>>>,
-) -> Rc<Window> {
-    if let Some(existing) = slot.borrow().clone() {
-        return existing;
-    }
-
+/// A new window, sharing everything the application built once at startup.
+///
+/// Nothing here keeps the window: the application owns it until it is closed,
+/// and closing the last one is what ends the process.
+fn new_window(app: &adw::Application, state: &Rc<AppState>) -> Rc<Window> {
     let window = Window::new(
         app,
         Rc::clone(&state.config),
@@ -173,11 +177,12 @@ fn ensure_window(
         state.theme.clone(),
     );
 
+    // Whatever went wrong at startup is reported once, in the first window that
+    // opens, rather than in every window for the rest of the session.
     if let Some(message) = state.startup_notice.borrow_mut().take() {
         window.show_banner(&message);
     }
 
-    *slot.borrow_mut() = Some(Rc::clone(&window));
     window
 }
 
